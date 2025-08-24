@@ -20,14 +20,14 @@
 from __future__ import annotations as _annotations
 
 import argparse
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 import logging
 import os
 import json
 import sys
 import signal
 from typing import Any, Sequence
-
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 
 from typing import Dict, Any, Generic, Literal
@@ -683,9 +683,10 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         log.debug("Token validation successful")
         return await call_next(request)
 
-
 async def handle_execute_junos_command(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for execute_junos_command tool"""
+    start_time = time.time()
+    start_timestamp = datetime.now(timezone.utc).isoformat()
     router_name = arguments.get("router_name", "")
     command = arguments.get("command", "")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
@@ -696,7 +697,22 @@ async def handle_execute_junos_command(arguments: dict, context: Context) -> lis
         log.debug(f"Executing command {command} on router {router_name} with timeout {timeout}s")
         result = _run_junos_cli_command(router_name, command, timeout)
     
-    return [types.TextContent(type="text", text=result)]
+    end_time = time.time()
+    end_timestamp = datetime.now(timezone.utc).isoformat()
+    execution_duration = round(end_time - start_time, 3)
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name, 
+                     "command": command, 
+                     "metadata": {
+                        "execution_duration": execution_duration,
+                        "start_time": start_timestamp,
+                        "end_time": end_timestamp
+                        }
+                    })
+    log.debug(f"content block: {content_block}")
+    return [content_block]
 
 
 async def handle_get_junos_config(arguments: dict, context: Context) -> list[types.ContentBlock]:
@@ -709,7 +725,14 @@ async def handle_get_junos_config(arguments: dict, context: Context) -> list[typ
         log.debug(f"Getting configuration from router {router_name}")
         result = _run_junos_cli_command(router_name, "show configuration | display inheritance no-comments | no-more")
     
-    return [types.TextContent(type="text", text=result)]
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name}
+        )
+    log.debug(f"content block: {content_block}")
+
+    return [content_block]
 
 
 async def handle_junos_config_diff(arguments: dict, context: Context) -> list[types.ContentBlock]:
@@ -722,8 +745,15 @@ async def handle_junos_config_diff(arguments: dict, context: Context) -> list[ty
     else:
         log.debug(f"Getting configuration diff from router {router_name} for version {version}")
         result = _run_junos_cli_command(router_name, f"show configuration | compare rollback {version}")
-    
-    return [types.TextContent(type="text", text=result)]
+
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name, "config_diff_version": version}
+        )
+    log.debug(f"content block: {content_block}")
+
+    return [content_block]
 
 
 async def handle_gather_device_facts(arguments: dict, context: Context) -> list[types.ContentBlock]:
@@ -762,8 +792,15 @@ async def handle_gather_device_facts(arguments: dict, context: Context) -> list[
                 result = f"Connection error to {router_name}: {ce}"
             except Exception as e:
                 result = f"An error occurred: {e}"
+
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name}
+        )
+    log.debug(f"content block: {content_block}")
     
-    return [types.TextContent(type="text", text=result)]
+    return [content_block]
 
 
 async def handle_get_router_list(arguments: dict, context: Context) -> list[types.ContentBlock]:
@@ -771,7 +808,14 @@ async def handle_get_router_list(arguments: dict, context: Context) -> list[type
     log.debug("Getting list of routers")
     routers = list(devices.keys())
     result = ', '.join(routers)
-    return [types.TextContent(type="text", text=result)]
+    
+    content_block = types.TextContent(
+        type="text",
+        text=result
+        )
+    
+    log.debug(f"content block: {content_block}")
+    return [content_block]
 
 
 async def handle_load_and_commit_config(arguments: dict, context: Context) -> list[types.ContentBlock]:
@@ -842,7 +886,14 @@ async def handle_load_and_commit_config(arguments: dict, context: Context) -> li
             except Exception as e:
                 result = f"An error occurred: {e}"
     
-    return [types.TextContent(type="text", text=result)]
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name, "config_text": config_text,
+                     "config_format":config_format,"commit_comment":commit_comment}
+        )
+
+    return [content_block]
 
 
 # Tool registry mapping tool names to their handler functions
