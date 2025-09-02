@@ -20,14 +20,14 @@
 from __future__ import annotations as _annotations
 
 import argparse
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 import logging
 import os
 import json
 import sys
 import signal
 from typing import Any, Sequence
-
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Sequence
 
 from typing import Dict, Any, Generic, Literal
@@ -581,8 +581,6 @@ The device is now available for use with all Junos MCP tools."""
         log.error(f"Unexpected error in add_device: {e}")
         return [types.TextContent(type="text", text=f"❌ Failed to add device: {str(e)}")]
 
-
-
 def _run_junos_cli_command(router_name: str, command: str, format: str = "text", timeout: int = 360) -> str:
     """Internal helper to connect and run a Junos CLI command."""
     log.debug(f"Executing command {command} on router {router_name} with format {format} and timeout {timeout}s (internal)")
@@ -605,6 +603,20 @@ def _run_junos_cli_command(router_name: str, command: str, format: str = "text",
         return f"Connection error to {router_name}: {ce}"
     except Exception as e:
         return f"An error occurred: {e}"
+
+def get_timeout_with_fallback(arguments_timeout: int = None) -> int:
+    """Get timeout value with fallback priority: arguments -> ENV -> default (360)"""
+    if arguments_timeout is not None:
+        return arguments_timeout
+    
+    env_timeout = os.getenv('JUNOS_TIMEOUT')
+    if env_timeout is not None:
+        try:
+            return int(env_timeout)
+        except ValueError:
+            log.warning(f"Invalid JUNOS_TIMEOUT environment variable value: {env_timeout}. Using default timeout.")
+    
+    return 360
 
 def validate_token_from_file(token: str) -> bool:
     """Validate if a token exists in the .tokens file"""
@@ -674,56 +686,84 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         log.debug("Token validation successful")
         return await call_next(request)
 
-
 async def handle_execute_junos_command(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for execute_junos_command tool"""
+    start_time = time.time()
+    start_timestamp = datetime.now(timezone.utc).isoformat()
     router_name = arguments.get("router_name", "")
     command = arguments.get("command", "")
     out_format = arguments.get("format", "text")
-    timeout = arguments.get("timeout", 360)
+    timeout = get_timeout_with_fallback(arguments.get("timeout"))
     
     if router_name not in devices:
         result = f"Router {router_name} not found in the device mapping."
     else:
-        log.debug(f"Executing command {command} on router {router_name} with timeout {timeout}s")
+        log.debug(f"Executing command {command} on router {router_name} with format {out_format} and timeout {timeout}s")
         result = _run_junos_cli_command(router_name, command, out_format, timeout)
-    
-    return [types.TextContent(type="text", text=result)]
+
+    end_time = time.time()
+    end_timestamp = datetime.now(timezone.utc).isoformat()
+    execution_duration = round(end_time - start_time, 3)
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name, 
+                     "command": command, 
+                     "metadata": {
+                        "execution_duration": execution_duration,
+                        "start_time": start_timestamp,
+                        "end_time": end_timestamp
+                        }
+                    })
+    log.debug(f"content block: {content_block}")
+    return [content_block]
 
 
 async def handle_get_junos_config(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for get_junos_config tool"""
     router_name = arguments.get("router_name", "")
-    out_format = arguments.get("format", "text")
     
     if router_name not in devices:
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug(f"Getting configuration from router {router_name}")
-        result = _run_junos_cli_command(router_name, "show configuration | display inheritance no-comments | no-more", out_format)
+        result = _run_junos_cli_command(router_name, "show configuration | display inheritance no-comments | no-more")
+    
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name}
+        )
+    log.debug(f"content block: {content_block}")
 
-    return [types.TextContent(type="text", text=result)]
+    return [content_block]
 
 
 async def handle_junos_config_diff(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for junos_config_diff tool"""
     router_name = arguments.get("router_name", "")
     version = arguments.get("version", 1)
-    out_format = arguments.get("format", "text")
     
     if router_name not in devices:
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug(f"Getting configuration diff from router {router_name} for version {version}")
-        result = _run_junos_cli_command(router_name, f"show configuration | compare rollback {version}", out_format)
+        result = _run_junos_cli_command(router_name, f"show configuration | compare rollback {version}")
 
-    return [types.TextContent(type="text", text=result)]
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name, "config_diff_version": version}
+        )
+    log.debug(f"content block: {content_block}")
+
+    return [content_block]
 
 
 async def handle_gather_device_facts(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for gather_device_facts tool"""
     router_name = arguments.get("router_name", "")
-    timeout = arguments.get("timeout", 360)
+    timeout = get_timeout_with_fallback(arguments.get("timeout"))
     
     if router_name not in devices:
         result = f"Router {router_name} not found in the device mapping."
@@ -756,8 +796,15 @@ async def handle_gather_device_facts(arguments: dict, context: Context) -> list[
                 result = f"Connection error to {router_name}: {ce}"
             except Exception as e:
                 result = f"An error occurred: {e}"
+
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name}
+        )
+    log.debug(f"content block: {content_block}")
     
-    return [types.TextContent(type="text", text=result)]
+    return [content_block]
 
 
 async def handle_get_router_list(arguments: dict, context: Context) -> list[types.ContentBlock]:
@@ -765,7 +812,14 @@ async def handle_get_router_list(arguments: dict, context: Context) -> list[type
     log.debug("Getting list of routers")
     routers = list(devices.keys())
     result = ', '.join(routers)
-    return [types.TextContent(type="text", text=result)]
+    
+    content_block = types.TextContent(
+        type="text",
+        text=result
+        )
+    
+    log.debug(f"content block: {content_block}")
+    return [content_block]
 
 
 async def handle_load_and_commit_config(arguments: dict, context: Context) -> list[types.ContentBlock]:
@@ -774,6 +828,7 @@ async def handle_load_and_commit_config(arguments: dict, context: Context) -> li
     config_text = arguments.get("config_text", "")
     config_format = arguments.get("config_format", "set")
     commit_comment = arguments.get("commit_comment", "Configuration loaded via MCP")
+    timeout = get_timeout_with_fallback(arguments.get("timeout"))
     
     if router_name not in devices:
         result = f"Router {router_name} not found in the device mapping."
@@ -817,7 +872,7 @@ async def handle_load_and_commit_config(arguments: dict, context: Context) -> li
                                     result = "No configuration changes detected"
                                 else:
                                     # Commit the configuration
-                                    config_util.commit(comment=commit_comment)
+                                    config_util.commit(comment=commit_comment, timeout=timeout)
                                     config_util.unlock()
                                     result = f"Configuration successfully loaded and committed on {router_name}. Changes:\n{diff}"
                                     
@@ -835,7 +890,14 @@ async def handle_load_and_commit_config(arguments: dict, context: Context) -> li
             except Exception as e:
                 result = f"An error occurred: {e}"
     
-    return [types.TextContent(type="text", text=result)]
+    content_block = types.TextContent(
+        type="text",
+        text=result,
+        annotations={"router_name": router_name, "config_text": config_text,
+                     "config_format":config_format,"commit_comment":commit_comment}
+        )
+
+    return [content_block]
 
 
 # Tool registry mapping tool names to their handler functions
@@ -856,7 +918,7 @@ TOOL_HANDLERS = {
 
 def create_mcp_server() -> Server:
     """Create and configure the MCP server with all tools"""
-    app = Server(JUNOS_MCP)
+    app = Server(JUNOS_MCP, version="1.0.0")
     
     @app.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.ContentBlock]:
@@ -911,8 +973,7 @@ def create_mcp_server() -> Server:
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "router_name": {"type": "string", "description": "The name of the router"},
-                        "format": {"type": "string", "description": "Output format: text or json", "default": "text"},
+                        "router_name": {"type": "string", "description": "The name of the router"}
                     },
                     "required": ["router_name"]
                 }
@@ -924,8 +985,7 @@ def create_mcp_server() -> Server:
                     "type": "object",
                     "properties": {
                         "router_name": {"type": "string", "description": "The name of the router"},
-                        "version": {"type": "integer", "description": "Rollback version to compare against (1-49)", "default": 1},
-                        "format": {"type": "string", "description": "Output format: text or json", "default": "text"},
+                        "version": {"type": "integer", "description": "Rollback version to compare against (1-49)", "default": 1}
                     },
                     "required": ["router_name"]
                 }
@@ -1057,19 +1117,13 @@ def main():
         if args.transport == 'stdio':
             # For stdio transport, run directly
             from mcp.server.stdio import stdio_server
-            from mcp.server.models import InitializationOptions, ServerCapabilities
             
             async def run_stdio():
                 async with stdio_server() as (read_stream, write_stream):
-                    init_options = InitializationOptions(
-                        server_name=JUNOS_MCP,
-                        server_version="1.0.0",
-                        capabilities=ServerCapabilities()
-                    )
                     await mcp_server.run(
                         read_stream,
                         write_stream,
-                        init_options
+                        mcp_server.create_initialization_options()
                     )
             
             anyio.run(run_stdio)
