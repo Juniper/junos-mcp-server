@@ -161,6 +161,13 @@ Examples:
         help='Enable verbose logging'
     )
     
+    parser.add_argument(
+        '--format',
+        choices=['json', 'text'],
+        default='text',
+        help='Output format for command results'
+    )
+    
     args = parser.parse_args()
     
     # Set logging level
@@ -192,6 +199,7 @@ Examples:
         result = jmcp._run_junos_cli_command(
             args.router,
             args.command,
+            format=args.format,
             timeout=args.timeout
         )
         print("\nResult:")
