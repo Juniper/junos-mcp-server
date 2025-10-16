@@ -77,7 +77,7 @@ from mcp.types import Tool as MCPTool
 
 
 from jnpr.junos import Device
-from jnpr.junos.exception import ConnectError
+from jnpr.junos.exception import ConnectError, ConfigLoadError, CommitError, LockError
 from jnpr.junos.utils.config import Config
 
 from utils.config import prepare_connection_params, validate_device_config, validate_all_devices
@@ -757,8 +757,6 @@ async def handle_junos_config_diff(arguments: dict, context: Context) -> list[ty
 
     return [content_block]
 
-
-
 async def handle_render_and_apply_j2_template(arguments: dict, context) -> list[types.ContentBlock]:
     """
     Handler for render_and_apply_j2_template tool
@@ -834,6 +832,8 @@ async def handle_render_and_apply_j2_template(arguments: dict, context) -> list[
     try:
         await context.info("Rendering Jinja2 template...")
         
+        from jinja2 import Environment, TemplateError
+        
         env = Environment(
             trim_blocks=True,
             lstrip_blocks=True,
@@ -883,9 +883,6 @@ To apply this configuration to devices, set apply_config=true and provide router
             text="❌ Error: router_name or router_names must be provided when apply_config=true"
         )]
     
-    # Import devices from global scope
-    from __main__ import devices
-    
     application_results = []
     
     for rtr_name in router_names:
@@ -895,32 +892,100 @@ To apply this configuration to devices, set apply_config=true and provide router
             continue
         
         try:
-            await context.info(f"Applying configuration to {rtr_name}...")
+            await context.info(f"{'Checking' if dry_run else 'Applying'} configuration on {rtr_name}...")
             
-            # Use the existing load_and_commit_config handler
-            from __main__ import handle_load_and_commit_config
+            device_info = devices[rtr_name]
             
-            apply_args = {
-                "router_name": rtr_name,
-                "config_text": rendered_config,
-                "config_format": "set",
-                "commit_comment": commit_comment,
-                "dry_run": dry_run
-            }
+            # Use prepare_connection_params to get proper connection parameters
+            try:
+                connect_params = prepare_connection_params(device_info, rtr_name)
+            except ValueError as ve:
+                application_results.append(f"❌ {rtr_name}: {ve}")
+                await context.error(f"{rtr_name}: {ve}")
+                continue
             
-            result = await handle_load_and_commit_config(apply_args, context)
+            # Connect to device
+            dev = Device(**connect_params)
             
-            # Extract the text from the result
-            if result and len(result) > 0:
-                result_text = result[0].text
-                application_results.append(f"{'🔍' if dry_run else '✅'} {rtr_name}: {result_text}")
-            else:
-                application_results.append(f"❓ {rtr_name}: Unknown result")
+            try:
+                dev.open()
+                await context.info(f"Connected to {rtr_name}")
                 
+                # Load configuration using exclusive mode
+                try:
+                    with Config(dev, mode='exclusive') as cu:
+                        await context.info(f"Loading configuration on {rtr_name}...")
+                        cu.load(rendered_config, format='set')
+                        
+                        # Get diff
+                        diff = cu.diff()
+                        
+                        if not diff:
+                            result_msg = "No configuration changes detected"
+                            application_results.append(f"ℹ️  {rtr_name}: {result_msg}")
+                            await context.info(f"{rtr_name}: {result_msg}")
+                        else:
+                            if dry_run:
+                                # DRY RUN: Perform commit check, show diff, and rollback without committing
+                                await context.info(f"Performing commit check on {rtr_name}...")
+                                
+                                try:
+                                    check_result = cu.commit_check()
+                                    
+                                    if not check_result:
+                                        result_msg = f"Commit check failed - configuration has errors"
+                                        application_results.append(f"❌ {rtr_name}: {result_msg}")
+                                        await context.error(f"{rtr_name}: {result_msg}")
+                                    else:
+                                        result_msg = f"Configuration check successful. Changes:\n\n{diff}"
+                                        application_results.append(f"🔍 {rtr_name}: {result_msg}")
+                                        await context.info(f"{rtr_name}: Dry-run commit check passed")
+                                    
+                                except Exception as check_error:
+                                    result_msg = f"Commit check error: {check_error}"
+                                    application_results.append(f"❌ {rtr_name}: {result_msg}")
+                                    await context.error(f"{rtr_name}: {result_msg}")
+                                finally:
+                                    # CRITICAL: Always rollback in dry-run mode
+                                    await context.info(f"{rtr_name}: Rolling back changes (dry-run mode)")
+                                    cu.rollback()
+                            else:
+                                # REAL COMMIT: Perform commit check before committing
+                                await context.info(f"Performing commit check on {rtr_name}...")
+                                check_result = cu.commit_check()
+                                
+                                if not check_result:
+                                    result_msg = "Commit check failed - configuration has errors"
+                                    application_results.append(f"❌ {rtr_name}: {result_msg}")
+                                    await context.error(f"{rtr_name}: {result_msg}")
+                                    cu.rollback()
+                                else:
+                                    # Apply the changes
+                                    await context.info(f"Committing configuration on {rtr_name}...")
+                                    cu.commit(comment=commit_comment)
+                                    result_msg = f"Configuration committed successfully. Changes:\n\n{diff}"
+                                    application_results.append(f"✅ {rtr_name}: {result_msg}")
+                                    await context.info(f"{rtr_name}: Configuration committed successfully")
+                
+                except (ConfigLoadError, CommitError, LockError) as e:
+                    error_msg = f"Configuration error: {e}"
+                    application_results.append(f"❌ {rtr_name}: {error_msg}")
+                    await context.error(f"{rtr_name}: {error_msg}")
+                    
+            except ConnectError as e:
+                error_msg = f"Connection failed: {e}"
+                application_results.append(f"❌ {rtr_name}: {error_msg}")
+                await context.error(f"{rtr_name}: {error_msg}")
+            finally:
+                # Always close the device connection
+                if dev.connected:
+                    dev.close()
+                    await context.info(f"Disconnected from {rtr_name}")
+                    
         except Exception as e:
-            error_msg = f"❌ {rtr_name}: Failed to apply configuration: {e}"
-            application_results.append(error_msg)
-            await context.error(error_msg)
+            error_msg = f"Failed to apply configuration: {e}"
+            application_results.append(f"❌ {rtr_name}: {error_msg}")
+            await context.error(f"{rtr_name}: {error_msg}")
     
     # Step 6: Format final results
     summary = "\n".join(application_results)
@@ -948,8 +1013,6 @@ To apply this configuration to devices, set apply_config=true and provide router
             "variables": str(variables)
         }
     )]
-
-
 
 async def handle_gather_device_facts(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for gather_device_facts tool"""
