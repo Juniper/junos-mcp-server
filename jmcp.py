@@ -725,7 +725,7 @@ async def handle_get_junos_config(arguments: dict, context: Context) -> list[typ
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug(f"Getting configuration from router {router_name}")
-        result = _run_junos_cli_command(router_name, "show configuration | display inheritance no-comments | no-more")
+        result = _run_junos_cli_command(router_name, "show configuration | display inheritance no-comments | display set | no-more")
     
     content_block = types.TextContent(
         type="text",
