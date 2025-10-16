@@ -583,11 +583,9 @@ The device is now available for use with all Junos MCP tools."""
         log.error(f"Unexpected error in add_device: {e}")
         return [types.TextContent(type="text", text=f"❌ Failed to add device: {str(e)}")]
 
-
-
-def _run_junos_cli_command(router_name: str, command: str, timeout: int = 360) -> str:
+def _run_junos_cli_command(router_name: str, command: str, format: str = "text", timeout: int = 360) -> str:
     """Internal helper to connect and run a Junos CLI command."""
-    log.debug(f"Executing command {command} on router {router_name} with timeout {timeout}s (internal)")
+    log.debug(f"Executing command {command} on router {router_name} with format {format} and timeout {timeout}s (internal)")
     device_info = devices[router_name]
     try:
         connect_params = prepare_connection_params(device_info, router_name)
@@ -596,7 +594,12 @@ def _run_junos_cli_command(router_name: str, command: str, timeout: int = 360) -
     try:
         with Device(**connect_params) as junos_device:            
             junos_device.timeout = timeout
-            op = junos_device.cli(command, warning=False)
+            op = junos_device.cli(command, warning=False, format=format)
+            if format.lower() == "json":
+                try:
+                    op = json.dumps(op, indent=2)
+                except json.JSONDecodeError:
+                    op = f"Error: Could not parse JSON output from command {command}"
             return op
     except ConnectError as ce:
         return f"Connection error to {router_name}: {ce}"
@@ -691,14 +694,15 @@ async def handle_execute_junos_command(arguments: dict, context: Context) -> lis
     start_timestamp = datetime.now(timezone.utc).isoformat()
     router_name = arguments.get("router_name", "")
     command = arguments.get("command", "")
+    out_format = arguments.get("format", "text")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
     
     if router_name not in devices:
         result = f"Router {router_name} not found in the device mapping."
     else:
-        log.debug(f"Executing command {command} on router {router_name} with timeout {timeout}s")
-        result = _run_junos_cli_command(router_name, command, timeout)
-    
+        log.debug(f"Executing command {command} on router {router_name} with format {out_format} and timeout {timeout}s")
+        result = _run_junos_cli_command(router_name, command, out_format, timeout)
+
     end_time = time.time()
     end_timestamp = datetime.now(timezone.utc).isoformat()
     execution_duration = round(end_time - start_time, 3)
@@ -1153,6 +1157,7 @@ def create_mcp_server() -> Server:
                     "properties": {
                         "router_name": {"type": "string", "description": "The name of the router"},
                         "command": {"type": "string", "description": "The command to execute on the router"},
+                        "format": {"type": "string", "description": "Output format: text or json", "default": "text"},
                         "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 360}
                     },
                     "required": ["router_name", "command"]
