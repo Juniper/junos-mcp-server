@@ -54,6 +54,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from mcp.server.stdio import stdio_server
 from mcp.server.session import ServerSession, ServerSessionT
 from mcp.server.elicitation import ElicitationResult, ElicitSchemaModelT, elicit_with_validation
 
@@ -74,7 +75,7 @@ from mcp.types import PromptArgument as MCPPromptArgument
 from mcp.types import Resource as MCPResource
 from mcp.types import ResourceTemplate as MCPResourceTemplate
 from mcp.types import Tool as MCPTool
-
+from jinja2 import Environment, TemplateError
 
 from jnpr.junos import Device
 from jnpr.junos.exception import ConnectError, ConfigLoadError, CommitError, LockError
@@ -832,8 +833,6 @@ async def handle_render_and_apply_j2_template(arguments: dict, context) -> list[
     try:
         await context.info("Rendering Jinja2 template...")
         
-        from jinja2 import Environment, TemplateError
-        
         env = Environment(
             trim_blocks=True,
             lstrip_blocks=True,
@@ -948,7 +947,21 @@ To apply this configuration to devices, set apply_config=true and provide router
                                 finally:
                                     # CRITICAL: Always rollback in dry-run mode
                                     await context.info(f"{rtr_name}: Rolling back changes (dry-run mode)")
-                                    cu.rollback()
+                                    try:
+                                        # Perform the rollback
+                                        cu.rollback()
+                                        # Verify rollback success by checking if there are pending changes
+                                        # After a successful rollback, there should be no differences
+                                        diff = cu.diff()
+                                        
+                                        if diff:
+                                            await context.error(f"{rtr_name}: Rollback verification failed - unexpected changes remain")
+                                            await context.error(f"{rtr_name}: Remaining diff:\n{diff}")
+                                        else:
+                                            await context.info(f"{rtr_name}: Rollback verified successfully - no pending changes")
+                                            
+                                    except Exception as rollback_error:
+                                        await context.error(f"{rtr_name}: Rollback failed with error: {str(rollback_error)}")
                             else:
                                 # REAL COMMIT: Perform commit check before committing
                                 await context.info(f"Performing commit check on {rtr_name}...")
@@ -966,22 +979,24 @@ To apply this configuration to devices, set apply_config=true and provide router
                                     result_msg = f"Configuration committed successfully. Changes:\n\n{diff}"
                                     application_results.append(f"✅ {rtr_name}: {result_msg}")
                                     await context.info(f"{rtr_name}: Configuration committed successfully")
-                
+
                 except (ConfigLoadError, CommitError, LockError) as e:
                     error_msg = f"Configuration error: {e}"
                     application_results.append(f"❌ {rtr_name}: {error_msg}")
                     await context.error(f"{rtr_name}: {error_msg}")
-                    
+
             except ConnectError as e:
                 error_msg = f"Connection failed: {e}"
                 application_results.append(f"❌ {rtr_name}: {error_msg}")
                 await context.error(f"{rtr_name}: {error_msg}")
             finally:
                 # Always close the device connection
-                if dev.connected:
+                try:
                     dev.close()
                     await context.info(f"Disconnected from {rtr_name}")
-                    
+                except Exception as close_error:
+                    log.warning(f"Error while closing test connection to {rtr_name}: {close_error}")
+
         except Exception as e:
             error_msg = f"Failed to apply configuration: {e}"
             application_results.append(f"❌ {rtr_name}: {error_msg}")
@@ -1385,8 +1400,6 @@ def main():
     # Run with the specified transport
     try:
         if args.transport == 'stdio':
-            # For stdio transport, run directly
-            from mcp.server.stdio import stdio_server
             
             async def run_stdio():
                 async with stdio_server() as (read_stream, write_stream):
