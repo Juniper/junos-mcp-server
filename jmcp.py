@@ -54,6 +54,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from mcp.server.stdio import stdio_server
 from mcp.server.session import ServerSession, ServerSessionT
 from mcp.server.elicitation import ElicitationResult, ElicitSchemaModelT, elicit_with_validation
 
@@ -74,10 +75,10 @@ from mcp.types import PromptArgument as MCPPromptArgument
 from mcp.types import Resource as MCPResource
 from mcp.types import ResourceTemplate as MCPResourceTemplate
 from mcp.types import Tool as MCPTool
-
+from jinja2 import Environment, TemplateError
 
 from jnpr.junos import Device
-from jnpr.junos.exception import ConnectError
+from jnpr.junos.exception import ConnectError, ConfigLoadError, CommitError, LockError
 from jnpr.junos.utils.config import Config
 
 from utils.config import prepare_connection_params, validate_device_config, validate_all_devices
@@ -395,7 +396,7 @@ async def handle_add_device(arguments: dict, context: Context) -> list[types.Con
                 ctx, "Please enter the device name:", 
                 ElicitationSchema.GetDeviceName, "name"
             )
-            
+
             if name_result is None:
                 return [types.TextContent(type="text", text="❌ Device name input cancelled.")]
             
@@ -410,7 +411,7 @@ async def handle_add_device(arguments: dict, context: Context) -> list[types.Con
                 # Ask for a different name
                 device_name = ""
                 continue
-        
+
         # Step 2: Get device IP
         while not device_ip:
             log.info("No device IP provided, asking user")
@@ -434,13 +435,13 @@ async def handle_add_device(arguments: dict, context: Context) -> list[types.Con
                 ctx, f"Please enter the SSH port for device '{device_name}' (default: 22):",
                 ElicitationSchema.GetDevicePort, "port"
             )
-            
+
             if port_result is None:
                 return [types.TextContent(type="text", text="❌ Device port input cancelled.")]
-            
+
             device_port = int(port_result)
             log.info(f"Received device port: {device_port}")
-        
+
         # Step 4: Get username
         while not username:
             log.info("Username not provided, asking user")
@@ -449,41 +450,41 @@ async def handle_add_device(arguments: dict, context: Context) -> list[types.Con
                 ctx, f"Please enter the username for device '{device_name}':",
                 ElicitationSchema.GetDeviceUsername, "username"
             )
-            
+
             if creds_result is None:
                 return [types.TextContent(type="text", text="❌ Username input cancelled.")]
-            
+
             username = str(creds_result).strip()
             log.info(f"Received username: '{username}'")
-        
+
         # Step 5: Get SSH key path
         while not ssh_key_path:
             log.info("SSH key path not provided, asking user")
-            
+
             ssh_key_result = await elicit_field_value(
                 ctx, f"Please enter the SSH private key file path for device '{device_name}':",
                 ElicitationSchema.GetSSHKeyPath, "ssh_key_path"
             )
-            
+
             if ssh_key_result is None:
                 return [types.TextContent(type="text", text="❌ SSH key path input cancelled.")]
-            
+
             ssh_key_path = str(ssh_key_result).strip()
-            
+
             # Validate SSH key file exists
             if not os.path.exists(ssh_key_path):
                 await ctx.warning(f"SSH key file '{ssh_key_path}' not found. Please enter a valid path.")
                 ssh_key_path = ""
                 continue
-            
+
             # Check if file is readable
             if not os.access(ssh_key_path, os.R_OK):
                 await ctx.warning(f"SSH key file '{ssh_key_path}' is not readable. Please check permissions.")
                 ssh_key_path = ""
                 continue
-            
+
             log.info(f"Received SSH key path: '{ssh_key_path}'")
-        
+
         # Step 6: Show summary and ask for confirmation
         device_summary = f"""Device Details:
 • Name: {device_name}
@@ -491,21 +492,21 @@ async def handle_add_device(arguments: dict, context: Context) -> list[types.Con
 • Port: {device_port}
 • Username: {username}
 • SSH Key: {ssh_key_path}"""
-        
+
         confirmation = await elicit_field_value(
             ctx,
             f"Please confirm adding this device:\n\n{device_summary}",
             ElicitationSchema.ConfirmDeviceAdd,
             None
         )
-        
+
         if confirmation is None or not confirmation.confirm:
             return [types.TextContent(type="text", text="❌ Device addition cancelled.")]
-        
+
         # Step 7: Optional connection test
         if confirmation.test_connection:
             await ctx.info(f"Testing connection to {device_name}...")
-            
+
             # Create device configuration for testing
             test_device_info = {
                 "ip": device_ip,
@@ -516,19 +517,19 @@ async def handle_add_device(arguments: dict, context: Context) -> list[types.Con
                     "private_key_path": ssh_key_path
                 }
             }
-            
+
             test_device = None
             try:
                 connect_params = prepare_connection_params(test_device_info, device_name)
-                
+
                 # Create device instance for testing
                 test_device = Device(**connect_params)
                 test_device.open()
                 test_device.timeout = 10
-                
+
                 # Just test the connection, don't run any commands
                 await ctx.info(f"✅ Connection test successful!")
-                    
+
             except Exception as e:
                 log.error(f"Connection test failed for {device_name}: {e}")
                 return [types.TextContent(type="text", text=f"❌ Connection test failed: {str(e)}\nDevice not added.")]
@@ -547,7 +548,7 @@ async def handle_add_device(arguments: dict, context: Context) -> list[types.Con
                                 test_device._conn.close()
                         except Exception as transport_error:
                             log.warning(f"Error while closing test transport to {device_name}: {transport_error}")
-        
+
         # Step 8: Add device to global devices dictionary
         new_device_config = {
             "ip": device_ip,
@@ -558,7 +559,7 @@ async def handle_add_device(arguments: dict, context: Context) -> list[types.Con
                 "private_key_path": ssh_key_path
             }
         }
-        
+
         # Validate the new device configuration before adding
         validate_device_config(device_name, new_device_config)
         
@@ -576,13 +577,12 @@ Details:
 • Username: {username}
 
 The device is now available for use with all Junos MCP tools."""
-        
+
         return [types.TextContent(type="text", text=result_message)]
-        
+
     except Exception as e:
         log.error(f"Unexpected error in add_device: {e}")
         return [types.TextContent(type="text", text=f"❌ Failed to add device: {str(e)}")]
-
 
 
 def _run_junos_cli_command(router_name: str, command: str, timeout: int = 360) -> str:
@@ -607,14 +607,14 @@ def get_timeout_with_fallback(arguments_timeout: int = None) -> int:
     """Get timeout value with fallback priority: arguments -> ENV -> default (360)"""
     if arguments_timeout is not None:
         return arguments_timeout
-    
+
     env_timeout = os.getenv('JUNOS_TIMEOUT')
     if env_timeout is not None:
         try:
             return int(env_timeout)
         except ValueError:
             log.warning(f"Invalid JUNOS_TIMEOUT environment variable value: {env_timeout}. Using default timeout.")
-    
+
     return 360
 
 def validate_token_from_file(token: str) -> bool:
@@ -622,14 +622,14 @@ def validate_token_from_file(token: str) -> bool:
     try:
         if not os.path.exists(".tokens"):
             return False
-        
+
         with open(".tokens", 'r') as f:
             tokens = json.load(f)
-        
+
         for token_data in tokens.values():
             if token_data.get('token') == token:
                 return True
-        
+
         return False
     except (json.JSONDecodeError, FileNotFoundError, KeyError):
         return False
@@ -637,15 +637,15 @@ def validate_token_from_file(token: str) -> bool:
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
     """Middleware to check Bearer token authentication for streamable-http"""
-    
+
     def __init__(self, app, auth_enabled: bool = True):
         super().__init__(app)
         self.auth_enabled = auth_enabled
-    
+
     async def dispatch(self, request: Request, call_next):
         # Log all incoming requests during elicitation debugging
         log.info(f"Incoming request: {request.method} {request.url.path} from {request.client.host if request.client else 'unknown'}")
-        
+
         # Try to read request body for debugging
         if request.method == "POST":
             try:
@@ -659,11 +659,11 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                         log.info(f"Raw request body: {body[:200]}...")
             except Exception as e:
                 log.warning(f"Could not read request body: {e}")
-        
+
         # Skip auth if disabled (for stdio transport)
         if not self.auth_enabled:
             return await call_next(request)
-        
+
         auth_header = request.headers.get("authorization")
         if not auth_header or not auth_header.startswith("Bearer "):
             log.warning(f"Missing or invalid auth header for {request.method} {request.url.path}")
@@ -671,7 +671,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
                 {"error": "Missing or invalid Authorization header"}, 
                 status_code=401
             )
-        
+
         token = auth_header[7:]  # Remove "Bearer " prefix
         
         # Validate token against .tokens file
@@ -756,8 +756,6 @@ async def handle_junos_config_diff(arguments: dict, context: Context) -> list[ty
     log.debug(f"content block: {content_block}")
 
     return [content_block]
-
-
 
 async def handle_render_and_apply_j2_template(arguments: dict, context) -> list[types.ContentBlock]:
     """
@@ -882,10 +880,7 @@ To apply this configuration to devices, set apply_config=true and provide router
             type="text",
             text="❌ Error: router_name or router_names must be provided when apply_config=true"
         )]
-    
-    # Import devices from global scope
-    from __main__ import devices
-    
+
     application_results = []
     
     for rtr_name in router_names:
@@ -895,32 +890,116 @@ To apply this configuration to devices, set apply_config=true and provide router
             continue
         
         try:
-            await context.info(f"Applying configuration to {rtr_name}...")
+            await context.info(f"{'Checking' if dry_run else 'Applying'} configuration on {rtr_name}...")
             
-            # Use the existing load_and_commit_config handler
-            from __main__ import handle_load_and_commit_config
+            device_info = devices[rtr_name]
             
-            apply_args = {
-                "router_name": rtr_name,
-                "config_text": rendered_config,
-                "config_format": "set",
-                "commit_comment": commit_comment,
-                "dry_run": dry_run
-            }
+            # Use prepare_connection_params to get proper connection parameters
+            try:
+                connect_params = prepare_connection_params(device_info, rtr_name)
+            except ValueError as ve:
+                application_results.append(f"❌ {rtr_name}: {ve}")
+                await context.error(f"{rtr_name}: {ve}")
+                continue
             
-            result = await handle_load_and_commit_config(apply_args, context)
+            # Connect to device
+            dev = Device(**connect_params)
             
-            # Extract the text from the result
-            if result and len(result) > 0:
-                result_text = result[0].text
-                application_results.append(f"{'🔍' if dry_run else '✅'} {rtr_name}: {result_text}")
-            else:
-                application_results.append(f"❓ {rtr_name}: Unknown result")
+            try:
+                dev.open()
+                await context.info(f"Connected to {rtr_name}")
                 
+                # Load configuration using exclusive mode
+                try:
+                    with Config(dev, mode='exclusive') as cu:
+                        await context.info(f"Loading configuration on {rtr_name}...")
+                        cu.load(rendered_config, format='set')
+                        
+                        # Get diff
+                        diff = cu.diff()
+                        
+                        if not diff:
+                            result_msg = "No configuration changes detected"
+                            application_results.append(f"ℹ️  {rtr_name}: {result_msg}")
+                            await context.info(f"{rtr_name}: {result_msg}")
+                        else:
+                            if dry_run:
+                                # DRY RUN: Perform commit check, show diff, and rollback without committing
+                                await context.info(f"Performing commit check on {rtr_name}...")
+                                
+                                try:
+                                    check_result = cu.commit_check()
+                                    
+                                    if not check_result:
+                                        result_msg = f"Commit check failed - configuration has errors"
+                                        application_results.append(f"❌ {rtr_name}: {result_msg}")
+                                        await context.error(f"{rtr_name}: {result_msg}")
+                                    else:
+                                        result_msg = f"Configuration check successful. Changes:\n\n{diff}"
+                                        application_results.append(f"🔍 {rtr_name}: {result_msg}")
+                                        await context.info(f"{rtr_name}: Dry-run commit check passed")
+                                    
+                                except Exception as check_error:
+                                    result_msg = f"Commit check error: {check_error}"
+                                    application_results.append(f"❌ {rtr_name}: {result_msg}")
+                                    await context.error(f"{rtr_name}: {result_msg}")
+                                finally:
+                                    # CRITICAL: Always rollback in dry-run mode
+                                    await context.info(f"{rtr_name}: Rolling back changes (dry-run mode)")
+                                    try:
+                                        # Perform the rollback
+                                        cu.rollback()
+                                        # Verify rollback success by checking if there are pending changes
+                                        # After a successful rollback, there should be no differences
+                                        diff = cu.diff()
+                                        
+                                        if diff:
+                                            await context.error(f"{rtr_name}: Rollback verification failed - unexpected changes remain")
+                                            await context.error(f"{rtr_name}: Remaining diff:\n{diff}")
+                                        else:
+                                            await context.info(f"{rtr_name}: Rollback verified successfully - no pending changes")
+                                            
+                                    except Exception as rollback_error:
+                                        await context.error(f"{rtr_name}: Rollback failed with error: {str(rollback_error)}")
+                            else:
+                                # REAL COMMIT: Perform commit check before committing
+                                await context.info(f"Performing commit check on {rtr_name}...")
+                                check_result = cu.commit_check()
+                                
+                                if not check_result:
+                                    result_msg = "Commit check failed - configuration has errors"
+                                    application_results.append(f"❌ {rtr_name}: {result_msg}")
+                                    await context.error(f"{rtr_name}: {result_msg}")
+                                    cu.rollback()
+                                else:
+                                    # Apply the changes
+                                    await context.info(f"Committing configuration on {rtr_name}...")
+                                    cu.commit(comment=commit_comment)
+                                    result_msg = f"Configuration committed successfully. Changes:\n\n{diff}"
+                                    application_results.append(f"✅ {rtr_name}: {result_msg}")
+                                    await context.info(f"{rtr_name}: Configuration committed successfully")
+
+                except (ConfigLoadError, CommitError, LockError) as e:
+                    error_msg = f"Configuration error: {e}"
+                    application_results.append(f"❌ {rtr_name}: {error_msg}")
+                    await context.error(f"{rtr_name}: {error_msg}")
+
+            except ConnectError as e:
+                error_msg = f"Connection failed: {e}"
+                application_results.append(f"❌ {rtr_name}: {error_msg}")
+                await context.error(f"{rtr_name}: {error_msg}")
+            finally:
+                # Always close the device connection
+                try:
+                    dev.close()
+                    await context.info(f"Disconnected from {rtr_name}")
+                except Exception as close_error:
+                    log.warning(f"Error while closing test connection to {rtr_name}: {close_error}")
+
         except Exception as e:
-            error_msg = f"❌ {rtr_name}: Failed to apply configuration: {e}"
-            application_results.append(error_msg)
-            await context.error(error_msg)
+            error_msg = f"Failed to apply configuration: {e}"
+            application_results.append(f"❌ {rtr_name}: {error_msg}")
+            await context.error(f"{rtr_name}: {error_msg}")
     
     # Step 6: Format final results
     summary = "\n".join(application_results)
@@ -948,8 +1027,6 @@ To apply this configuration to devices, set apply_config=true and provide router
             "variables": str(variables)
         }
     )]
-
-
 
 async def handle_gather_device_facts(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for gather_device_facts tool"""
@@ -1322,8 +1399,6 @@ def main():
     # Run with the specified transport
     try:
         if args.transport == 'stdio':
-            # For stdio transport, run directly
-            from mcp.server.stdio import stdio_server
             
             async def run_stdio():
                 async with stdio_server() as (read_stream, write_stream):
