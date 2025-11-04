@@ -1,18 +1,19 @@
-.PHONY: test test-all test-config test-router-list docker-build help clean
+.PHONY: test test-all test-config test-router-list test-batch-command docker-build help clean
 
 # Default target
 help:
 	@echo "Available targets:"
-	@echo "  make test              - Run all tests"
-	@echo "  make test-all          - Run all tests (alias for test)"
-	@echo "  make test-config       - Run config validation tests"
-	@echo "  make test-router-list  - Run get_router_list tests"
-	@echo "  make docker-build      - Build Docker image"
-	@echo "  make clean             - Clean Python cache files"
-	@echo "  make help              - Show this help message"
+	@echo "  make test                - Run all tests"
+	@echo "  make test-all            - Run all tests (alias for test)"
+	@echo "  make test-config         - Run config validation tests"
+	@echo "  make test-router-list    - Run get_router_list tests"
+	@echo "  make test-batch-command  - Run batch command example"
+	@echo "  make docker-build        - Build Docker image"
+	@echo "  make clean               - Clean Python cache files"
+	@echo "  make help                - Show this help message"
 
 # Run all tests
-test: test-config test-router-list
+test: test-config test-router-list test-batch-command
 	@echo ""
 	@echo "=========================================="
 	@echo "All tests completed!"
@@ -30,6 +31,11 @@ test-config:
 test-router-list:
 	@echo "Running get_router_list tests..."
 	@uv run python test_get_router_list.py
+
+# Run batch command example
+test-batch-command:
+	@echo "Running batch command example..."
+	@uv run python test_batch_command.py
 
 # Build Docker image
 docker-build:
