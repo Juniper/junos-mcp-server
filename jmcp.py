@@ -692,21 +692,21 @@ async def handle_execute_junos_command(arguments: dict, context: Context) -> lis
     router_name = arguments.get("router_name", "")
     command = arguments.get("command", "")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
-    
+
     if router_name not in devices:
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug(f"Executing command {command} on router {router_name} with timeout {timeout}s")
         result = _run_junos_cli_command(router_name, command, timeout)
-    
+
     end_time = time.time()
     end_timestamp = datetime.now(timezone.utc).isoformat()
     execution_duration = round(end_time - start_time, 3)
     content_block = types.TextContent(
         type="text",
         text=result,
-        annotations={"router_name": router_name, 
-                     "command": command, 
+        annotations={"router_name": router_name,
+                     "command": command,
                      "metadata": {
                         "execution_duration": execution_duration,
                         "start_time": start_timestamp,
@@ -714,6 +714,226 @@ async def handle_execute_junos_command(arguments: dict, context: Context) -> lis
                         }
                     })
     log.debug(f"content block: {content_block}")
+    return [content_block]
+
+
+async def handle_execute_junos_command_batch(arguments: dict, context: Context) -> list[types.ContentBlock]:
+    """
+    Handler for execute_junos_command_batch tool - executes same command on multiple routers in parallel.
+
+    This function demonstrates async/await parallel execution patterns. The "magic" of parallelism
+    comes from three key concepts:
+
+    1. ASYNC/AWAIT: Allows cooperative multitasking - while one router is waiting for network I/O,
+       other routers can be contacted simultaneously
+
+    2. THREAD POOL: PyEZ's Device.cli() is synchronous (blocking), so we use anyio.to_thread.run_sync()
+       to run it in a background thread without blocking the async event loop
+
+    3. ASYNCIO.GATHER: Launches multiple async operations simultaneously and waits for all to complete
+
+    Real-world analogy: Instead of calling 3 restaurants sequentially and waiting on hold for each
+    (serial execution = 3 × 2 minutes = 6 minutes), you have 3 friends call simultaneously
+    (parallel execution = max(2, 2, 2) = 2 minutes total).
+    """
+    import asyncio
+
+    batch_start_time = time.time()
+    router_names = arguments.get("router_names", [])
+    command = arguments.get("command", "")
+    timeout = get_timeout_with_fallback(arguments.get("timeout"))
+
+    # ============================================================================
+    # STEP 1: Input Validation
+    # ============================================================================
+    # Fail fast if inputs are invalid - no point starting parallel execution
+    # if we know it will fail
+
+    if not router_names:
+        return [types.TextContent(
+            type="text",
+            text="Error: router_names list is required and cannot be empty"
+        )]
+
+    if not command:
+        return [types.TextContent(
+            type="text",
+            text="Error: command is required"
+        )]
+
+    # Validate all routers exist before executing - prevents partial failures
+    invalid_routers = [r for r in router_names if r not in devices]
+    if invalid_routers:
+        return [types.TextContent(
+            type="text",
+            text=f"Error: The following routers not found in device mapping: {', '.join(invalid_routers)}"
+        )]
+
+    log.info(f"Executing batch command on {len(router_names)} routers in parallel: {command}")
+    await context.info(f"Executing command on {len(router_names)} routers in parallel...")
+
+    # ============================================================================
+    # STEP 2: Define Per-Router Async Function
+    # ============================================================================
+    # This nested async function will be called once per router, and all calls
+    # will run in parallel thanks to asyncio.gather() below
+
+    async def execute_on_router(router_name: str) -> dict:
+        """
+        Execute command on a single router and return structured result.
+
+        This is an ASYNC function, which means it can yield control to the event loop
+        while waiting for I/O operations (like network connections to routers).
+
+        KEY INSIGHT: Each call to this function represents one "parallel task".
+        When we create 3 tasks, they all run concurrently.
+        """
+        start_time = time.time()
+        start_timestamp = datetime.now(timezone.utc).isoformat()
+
+        try:
+            # ----------------------------------------------------------------
+            # THE MAGIC: anyio.to_thread.run_sync()
+            # ----------------------------------------------------------------
+            # Problem: _run_junos_cli_command() is SYNCHRONOUS (blocking)
+            # - It uses PyEZ's Device.cli() which blocks the thread while waiting
+            # - If we called it directly, it would block the async event loop
+            # - This would make everything serial again (defeating parallelism)
+            #
+            # Solution: anyio.to_thread.run_sync()
+            # - Runs the blocking function in a background thread pool
+            # - The async event loop remains free to handle other tasks
+            # - Multiple threads can run simultaneously (one per router)
+            #
+            # Result: True parallel execution!
+            # - While router1's thread waits for SSH response, router2's thread
+            #   can be establishing its connection, and router3's thread can be
+            #   sending its command, etc.
+            #
+            # Think of it like: Each router gets its own phone line (thread),
+            # and all phone calls happen at the same time instead of one after another.
+
+            result = await anyio.to_thread.run_sync(
+                _run_junos_cli_command,  # The synchronous function to run
+                router_name,              # Arguments to pass to it
+                command,
+                timeout
+            )
+
+            # Determine if this was a success or error based on result content
+            # (the _run_junos_cli_command returns error messages as strings)
+            is_error = result.startswith("Connection error") or result.startswith("An error occurred") or result.startswith("Error:")
+            status = "failed" if is_error else "success"
+
+        except Exception as e:
+            # Catch any unexpected exceptions (shouldn't happen normally)
+            result = f"Exception during execution: {str(e)}"
+            status = "failed"
+
+        end_time = time.time()
+        end_timestamp = datetime.now(timezone.utc).isoformat()
+        execution_duration = round(end_time - start_time, 3)
+
+        # Return structured data for this single router
+        return {
+            "router_name": router_name,
+            "status": status,
+            "output": result,
+            "execution_duration": execution_duration,
+            "start_time": start_timestamp,
+            "end_time": end_timestamp
+        }
+
+    # ============================================================================
+    # STEP 3: Launch All Tasks in Parallel with asyncio.gather()
+    # ============================================================================
+    # This is where the REAL MAGIC happens!
+    #
+    # asyncio.gather() explanation:
+    # -----------------------------
+    # 1. List comprehension creates N async tasks (one per router):
+    #    [execute_on_router("router1"), execute_on_router("router2"), ...]
+    #
+    # 2. The * (splat) operator unpacks them as individual arguments:
+    #    asyncio.gather(task1, task2, task3, ...)
+    #
+    # 3. gather() schedules ALL tasks to run CONCURRENTLY on the event loop:
+    #    - All tasks start approximately at the same time
+    #    - While one task waits for I/O, others continue executing
+    #    - The event loop switches between tasks as they yield control (at await points)
+    #
+    # 4. await gather() waits for ALL tasks to complete and returns results in order:
+    #    results = [result1, result2, result3, ...]
+    #
+    # Timeline visualization (3 routers, each takes ~1.2 seconds):
+    #
+    # SERIAL EXECUTION (without gather):
+    # Router1: [===========]
+    # Router2:              [===========]
+    # Router3:                           [===========]
+    # Total:   |----------------------------------|  (~3.6 seconds)
+    #
+    # PARALLEL EXECUTION (with gather):
+    # Router1: [===========]
+    # Router2: [===========]
+    # Router3: [===========]
+    # Total:   |-----------|                         (~1.2 seconds)
+    #
+    # Key: Each router runs in its own thread, so they all complete in the time
+    # it takes for the slowest one to finish!
+
+    results = await asyncio.gather(
+        *[execute_on_router(router_name) for router_name in router_names],
+        return_exceptions=False  # If any task raises an exception, propagate it immediately
+    )
+
+    batch_end_time = time.time()
+    batch_duration = round(batch_end_time - batch_start_time, 3)
+
+    # ============================================================================
+    # STEP 4: Process and Format Results
+    # ============================================================================
+    # At this point, ALL routers have completed (or failed), and we have all results
+
+    # Calculate summary statistics
+    successful_count = sum(1 for r in results if r["status"] == "success")
+    failed_count = len(results) - successful_count
+
+    # Build structured response with summary + individual results
+    response_data = {
+        "summary": {
+            "command": command,
+            "total_routers": len(router_names),
+            "successful": successful_count,
+            "failed": failed_count,
+            "total_duration": batch_duration
+        },
+        "results": results  # This contains all per-router results in order
+    }
+
+    # Format as pretty JSON for LLM consumption
+    # The LLM can easily parse this and identify which output came from which router
+    formatted_output = json.dumps(response_data, indent=2)
+
+    log.info(f"Batch command execution completed: {successful_count} successful, {failed_count} failed, {batch_duration}s total")
+    await context.info(f"Batch execution complete: {successful_count}/{len(router_names)} successful")
+
+    # Return as MCP TextContent with annotations for structured metadata
+    content_block = types.TextContent(
+        type="text",
+        text=formatted_output,
+        annotations={
+            "command": command,
+            "router_names": router_names,
+            "batch_metadata": {
+                "total_routers": len(router_names),
+                "successful": successful_count,
+                "failed": failed_count,
+                "total_duration": batch_duration
+            }
+        }
+    )
+
     return [content_block]
 
 
@@ -1078,14 +1298,37 @@ async def handle_gather_device_facts(arguments: dict, context: Context) -> list[
 async def handle_get_router_list(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for get_router_list tool"""
     log.debug("Getting list of routers")
-    routers = list(devices.keys())
-    result = ', '.join(routers)
-    
+
+    # Build structured device information, excluding sensitive data
+    router_info = {}
+    for router_name, device_config in devices.items():
+        # Create a deep copy of device config to avoid modifying original
+        import copy
+        filtered_config = copy.deepcopy(device_config)
+
+        # Exclude ssh_config (jump host/proxy configuration)
+        if "ssh_config" in filtered_config:
+            del filtered_config["ssh_config"]
+
+        # Exclude sensitive auth credentials but keep auth type
+        if "auth" in filtered_config:
+            # Remove password if present
+            if "password" in filtered_config["auth"]:
+                del filtered_config["auth"]["password"]
+            # Remove private key path if present
+            if "private_key_path" in filtered_config["auth"]:
+                del filtered_config["auth"]["private_key_path"]
+
+        router_info[router_name] = filtered_config
+
+    # Format as pretty JSON
+    result = json.dumps(router_info, indent=2)
+
     content_block = types.TextContent(
         type="text",
         text=result
         )
-    
+
     log.debug(f"content block: {content_block}")
     return [content_block]
 
@@ -1175,6 +1418,7 @@ async def handle_load_and_commit_config(arguments: dict, context: Context) -> li
 # 3. Add the tool definition to list_tools() method
 TOOL_HANDLERS = {
     "execute_junos_command": handle_execute_junos_command,
+    "execute_junos_command_batch": handle_execute_junos_command_batch,
     "get_junos_config": handle_get_junos_config,
     "junos_config_diff": handle_junos_config_diff,
     "render_and_apply_j2_template": handle_render_and_apply_j2_template,
@@ -1233,6 +1477,23 @@ def create_mcp_server() -> Server:
                         "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 360}
                     },
                     "required": ["router_name", "command"]
+                }
+            ),
+            types.Tool(
+                name="execute_junos_command_batch",
+                description="Execute the same Junos command on multiple routers in parallel. Returns structured JSON output with per-router results, timing, and success/failure status.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "router_names": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of router names to execute the command on"
+                        },
+                        "command": {"type": "string", "description": "The command to execute on all routers"},
+                        "timeout": {"type": "integer", "description": "Command timeout in seconds per router", "default": 360}
+                    },
+                    "required": ["router_names", "command"]
                 }
             ),
             types.Tool(
