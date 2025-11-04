@@ -1078,14 +1078,37 @@ async def handle_gather_device_facts(arguments: dict, context: Context) -> list[
 async def handle_get_router_list(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for get_router_list tool"""
     log.debug("Getting list of routers")
-    routers = list(devices.keys())
-    result = ', '.join(routers)
-    
+
+    # Build structured device information, excluding sensitive data
+    router_info = {}
+    for router_name, device_config in devices.items():
+        # Create a deep copy of device config to avoid modifying original
+        import copy
+        filtered_config = copy.deepcopy(device_config)
+
+        # Exclude ssh_config (jump host/proxy configuration)
+        if "ssh_config" in filtered_config:
+            del filtered_config["ssh_config"]
+
+        # Exclude sensitive auth credentials but keep auth type
+        if "auth" in filtered_config:
+            # Remove password if present
+            if "password" in filtered_config["auth"]:
+                del filtered_config["auth"]["password"]
+            # Remove private key path if present
+            if "private_key_path" in filtered_config["auth"]:
+                del filtered_config["auth"]["private_key_path"]
+
+        router_info[router_name] = filtered_config
+
+    # Format as pretty JSON
+    result = json.dumps(router_info, indent=2)
+
     content_block = types.TextContent(
         type="text",
         text=result
         )
-    
+
     log.debug(f"content block: {content_block}")
     return [content_block]
 
