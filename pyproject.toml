@@ -16,3 +16,12 @@ dependencies = [
     "uvicorn>=0.30.0",
     "starlette>=0.37.0",
 ]
+
+[project.scripts]
+junos-mcp-server = "jmcp:main"
+
+[tool.setuptools]
+py-modules = ["jmcp", "jmcp_token_manager"]
+
+[tool.setuptools.packages.find]
+include = ["utils*"]
