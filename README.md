@@ -418,7 +418,7 @@ lost when the server restarts
 - **Timeout**: Users have 5 minutes to respond to each prompt
 
 For Claude Desktop users, devices must still be configured in the `devices.json`
-file as described in the [Junos device config](#junos-device-config) section.
+file as described in the [Junos device config](#junos-device-configuration) section.
 
 ## VSCode + GitHub Copilot Integration
 
@@ -475,7 +475,8 @@ The server includes a dedicated token management CLI tool:
 python jmcp_token_manager.py generate --id "vscode-dev"
 
 # With description
-python jmcp_token_manager.py generate --id "vscode-dev" --description "VSCode development environment"
+python jmcp_token_manager.py generate --id "vscode-dev" --description "VSCode
+development environment"
 
 # Example output:
 Generated new token:
@@ -494,8 +495,10 @@ python jmcp_token_manager.py list
 # Example output:
 ID                   Description                              Created
 -------------------------------------------------------------------------------------
-vscode-dev          VSCode development environment           2025-01-28T10:30:00Z
-prod-client         Production client access                 2025-01-28T09:15:00Z
+vscode-dev          VSCode development environment
+2025-01-28T10:30:00Z
+prod-client         Production client access
+2025-01-28T09:15:00Z
 ```
 
 #### Show Token Value (Recovery)
@@ -539,7 +542,8 @@ INFO - Streamable HTTP server started on http://127.0.0.1:30030
 ```bash
 python jmcp.py -f devices.json -t streamable-http
 WARNING - No .tokens file found - server is open to all clients
-INFO - Create tokens using: python jmcp_token_manager.py generate --id <token-id>
+INFO - Create tokens using: python jmcp_token_manager.py generate --id <token-i
+>
 INFO - Streamable HTTP server started on http://127.0.0.1:30030
 ```
 
@@ -554,7 +558,8 @@ INFO - Streamable HTTP server started on http://127.0.0.1:30030
             "my-junos-mcp-server": {
                 "url": "http://127.0.0.1:30030/mcp/",
                 "headers": {
-                    "Authorization": "Bearer jmcp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8"
+                    "Authorization": "Bearer
+                    jmcp_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8"
                 }
             }
         }
@@ -725,7 +730,8 @@ TOOL_HANDLERS = {
     "gather_device_facts": handle_gather_device_facts,
     "get_router_list": handle_get_router_list,
     "load_and_commit_config": handle_load_and_commit_config,
-    "add_device": handle_add_device,      # Dynamic device management with elicitation
+    "add_device": handle_add_device,      # Dynamic device management with
+    elicitation
     "my_new_tool": handle_my_new_tool,    # Add your tool here
 }
 ```
@@ -741,8 +747,10 @@ types.Tool(
     inputSchema={
         "type": "object",
         "properties": {
-            "router_name": {"type": "string", "description": "The name of the router"},
-            "my_param": {"type": "string", "description": "Description of parameter"}
+            "router_name": {"type": "string", "description": "The name of the
+            router"},
+            "my_param": {"type": "string", "description": "Description of
+            parameter"}
         },
         "required": ["router_name"]  # List required parameters
     }
@@ -755,7 +763,8 @@ Here's a complete example of adding a tool to show BGP neighbors:
 
 ```python
 # Step 1: Handler function
-async def handle_show_bgp_neighbors(arguments: dict) -> list[types.ContentBlock]:
+async def handle_show_bgp_neighbors(arguments: dict) -> list[types.ContentBloc
+]:
     """Handler for show_bgp_neighbors tool"""
     router_name = arguments.get("router_name", "")
     neighbor_address = arguments.get("neighbor_address", "")
@@ -785,8 +794,10 @@ types.Tool(
     inputSchema={
         "type": "object",
         "properties": {
-            "router_name": {"type": "string", "description": "The name of the router"},
-            "neighbor_address": {"type": "string", "description": "Optional: specific neighbor IP"}
+            "router_name": {"type": "string", "description": "The name of the
+            router"},
+            "neighbor_address": {"type": "string", "description": "Optional:
+            specific neighbor IP"}
         },
         "required": ["router_name"]
     }
@@ -806,7 +817,8 @@ from pydantic import BaseModel, Field
 class MyInputSchema(BaseModel):
     user_input: str = Field(description="Enter your input")
 
-async def handle_my_elicitation_tool(arguments: dict, context: Context) -> list[types.ContentBlock]:
+async def handle_my_elicitation_tool(arguments: dict, context: Context) -> list
+[types.ContentBlock]:
     """Tool that uses elicitation to collect user input"""
 
     # Use elicitation to ask for user input
@@ -820,7 +832,8 @@ async def handle_my_elicitation_tool(arguments: dict, context: Context) -> list[
         case AcceptedElicitation(data=data):
             user_input = data.user_input
             # Process the input...
-            return [types.TextContent(type="text", text=f"Processing: {user_input}")]
+            return [types.TextContent(type="text", text=f"Processing:
+            {user_input}")]
         case DeclinedElicitation() | CancelledElicitation():
             return [types.TextContent(type="text", text="Operation cancelled")]
 ```
