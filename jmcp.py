@@ -1411,6 +1411,24 @@ async def handle_load_and_commit_config(arguments: dict, context: Context) -> li
     return [content_block]
 
 
+async def handle_execute_fpc_command(arguments: dict, context: Context) -> list[types.ContentBlock]:
+    """Handler for execute_fpc_command tool using cprod shell command"""
+    router_name = arguments.get("router_name", "")
+    fpc_slot = arguments.get("fpc_slot", "0")
+    fpc_command = arguments.get("fpc_command", "")
+    timeout = arguments.get("timeout", 360)
+
+    if router_name not in devices:
+        result = f"Router {router_name} not found in the device mapping."
+    else:
+        # Use start shell to access the shell and run cprod command
+        shell_command = f'start shell command "cprod -A fpc{fpc_slot} -c \'{fpc_command}\'"'
+        log.debug(f"Executing FPC command '{fpc_command}' on FPC{fpc_slot} of router {router_name} via shell")
+        result = _run_junos_cli_command(router_name, shell_command, timeout)
+
+    return [types.TextContent(type="text", text=result)]
+
+
 # Tool registry mapping tool names to their handler functions
 # To add a new tool:
 # 1. Create an async handler function: async def handle_my_new_tool(arguments: dict) -> list[types.ContentBlock]
@@ -1425,6 +1443,7 @@ TOOL_HANDLERS = {
     "gather_device_facts": handle_gather_device_facts,
     "get_router_list": handle_get_router_list,
     "load_and_commit_config": handle_load_and_commit_config,
+    "execute_fpc_command": handle_execute_fpc_command,  # FPC command execution via cprod
     "add_device": handle_add_device     # Dynamic device management
 }
 
@@ -1568,6 +1587,20 @@ def create_mcp_server() -> Server:
                         "commit_comment": {"type": "string", "description": "Commit comment", "default": "Configuration loaded via MCP"}
                     },
                     "required": ["router_name", "config_text"]
+                }
+            ),
+            types.Tool(
+                name="execute_fpc_command",
+                description="Execute FPC commands using cprod on a Junos router",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "router_name": {"type": "string", "description": "The name of the router"},
+                        "fpc_slot": {"type": "string", "description": "FPC slot number (e.g., '0', '1')", "default": "0"},
+                        "fpc_command": {"type": "string", "description": "The FPC command to execute (e.g., 'show version', 'show memory')"},
+                        "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 360}
+                    },
+                    "required": ["router_name", "fpc_command"]
                 }
             ),
             types.Tool(
