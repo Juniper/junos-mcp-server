@@ -1295,6 +1295,37 @@ async def handle_gather_device_facts(arguments: dict, context: Context) -> list[
     return [content_block]
 
 
+async def handle_reload_devices(arguments: dict, context: Context) -> list[types.ContentBlock]:
+    """Handler for reload_devices tool - reload devices dict from a new JSON file"""
+    global devices
+    file_name = arguments.get("file_name", "")
+
+    if not file_name:
+        return [types.TextContent(type="text", text="Error: file_name is required")]
+
+    try:
+        with open(file_name, 'r') as f:
+            new_devices = json.load(f)
+    except FileNotFoundError:
+        return [types.TextContent(type="text", text=f"Error: File '{file_name}' not found.")]
+    except json.JSONDecodeError:
+        return [types.TextContent(type="text", text=f"Error: File '{file_name}' is not a valid JSON file.")]
+
+    try:
+        validate_all_devices(new_devices)
+    except ValueError as e:
+        return [types.TextContent(type="text", text=f"Error: Device configuration validation failed: {e}")]
+
+    old_count = len(devices)
+    devices = new_devices
+    new_count = len(devices)
+
+    log.info(f"Reloaded devices from '{file_name}': {old_count} -> {new_count} device(s)")
+
+    result = f"Successfully reloaded devices from '{file_name}'. Previous: {old_count} device(s), Current: {new_count} device(s).\nLoaded devices: {', '.join(devices.keys())}"
+    return [types.TextContent(type="text", text=result)]
+
+
 async def handle_get_router_list(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for get_router_list tool"""
     log.debug("Getting list of routers")
@@ -1425,7 +1456,8 @@ TOOL_HANDLERS = {
     "gather_device_facts": handle_gather_device_facts,
     "get_router_list": handle_get_router_list,
     "load_and_commit_config": handle_load_and_commit_config,
-    "add_device": handle_add_device     # Dynamic device management
+    "add_device": handle_add_device,     # Dynamic device management
+    "reload_devices": handle_reload_devices  # Reload devices from a new JSON file
 }
 
 
@@ -1583,6 +1615,17 @@ def create_mcp_server() -> Server:
                         "ssh_key_path": {"type": "string", "description": "Path to SSH private key file", "default": ""}
                     },
                     "required": []
+                }
+            ),
+            types.Tool(
+                name="reload_devices",
+                description="Reload the devices dictionary from a new JSON file, replacing all existing devices",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "file_name": {"type": "string", "description": "Path to the JSON file containing the new device mapping"}
+                    },
+                    "required": ["file_name"]
                 }
             )
         ]
