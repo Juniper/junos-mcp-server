@@ -344,6 +344,7 @@ async def elicit_field_value(
         except asyncio.TimeoutError:
             log.error("Elicitation timed out after 300 seconds")
             return None
+
         match result:
             case AcceptedElicitation(data=data):
                 # Debug: print what we received
