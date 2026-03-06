@@ -605,6 +605,30 @@ def _run_junos_cli_command(router_name: str, command: str, timeout: int = 360) -
     except Exception as e:
         return f"An error occurred: {e}"
 
+def _run_junos_pfe_command(router_name: str, target: str, command: str, timeout: int = 360):
+    """
+    Internal helper to connect and run a Junos PFE command.
+    Returns:
+        dict: {target: result_text} on success
+        str: error message on failure
+    """
+    log.debug(f"Executing command {command} on router {router_name} with timeout {timeout}s (internal)")
+    device_info = devices[router_name]
+    try:
+        connect_params = prepare_connection_params(device_info, router_name)
+    except ValueError as ve:
+        return f"Error: {ve}"
+    try:
+        with Device(**connect_params) as junos_device:
+            junos_device.timeout = timeout
+            op = junos_device.rpc.request_pfe_execute(target=target, command=command)
+            result_text = op.text if hasattr(op, 'text') else str(op)
+            return {target: result_text}
+    except ConnectError as ce:
+        return f"Connection error to {router_name}: {ce}"
+    except Exception as e:
+        return f"An error occurred: {e}"
+
 def get_timeout_with_fallback(arguments_timeout: int = None) -> int:
     """Get timeout value with fallback priority: arguments -> ENV -> default (360)"""
     if arguments_timeout is not None:
@@ -1518,6 +1542,54 @@ async def handle_get_router_list(arguments: dict, context: Context) -> list[type
     log.debug(f"content block: {content_block}")
     return [content_block]
 
+async def handle_execute_pfe_command(arguments: dict, context: Context) -> list[types.ContentBlock]:
+    """Handler for execute_pfe_command tool"""
+    start_time = time.time()
+    start_timestamp = datetime.now(timezone.utc).isoformat()
+    router_name = arguments.get("router_name", "")
+    target = arguments.get("target", "")
+    command = arguments.get("command", "")
+    timeout = get_timeout_with_fallback(arguments.get("timeout"))
+
+    is_blocked, blocked_message = check_command_blocklist(command)
+    if is_blocked:
+        result_text = blocked_message
+    elif not isinstance(devices, dict):
+        result_text = "Error: Devices mapping is not a dictionary. Check devices.json format and loading logic."
+    elif router_name not in devices:
+        result_text = f"Router {router_name} not found in the device mapping."
+    else:
+        log.debug(f"Executing command {command} on router {router_name} with timeout {timeout}s")
+        result = _run_junos_pfe_command(router_name, target=target, command=command, timeout=timeout)
+        if isinstance(result, dict):
+            # Normal case: RPC succeeded, result is a dict keyed by target
+            result_text = result.get(target, str(result))
+        elif isinstance(result, str):
+            # Error case: result is a string error message
+            result_text = result
+        else:
+            # Unexpected type: convert to string and log warning
+            log.warning(f"Unexpected result type from _run_junos_pfe_command: {type(result)}")
+            result_text = str(result)
+
+    end_time = time.time()
+    end_timestamp = datetime.now(timezone.utc).isoformat()
+    execution_duration = round(end_time - start_time, 3)
+    content_block = types.TextContent(
+        type="text",
+        text=result_text,
+        annotations={"router_name": router_name,
+                     "target": target,
+                     "command": command,
+                     "metadata": {
+                        "execution_duration": execution_duration,
+                        "start_time": start_timestamp,
+                        "end_time": end_timestamp
+                        }
+                    })
+    log.debug(f"content block: {content_block}")
+    return [content_block]
+
 
 async def handle_load_and_commit_config(arguments: dict, context: Context) -> list[types.ContentBlock]:
     """Handler for load_and_commit_config tool"""
@@ -1636,6 +1708,7 @@ TOOL_HANDLERS = {
     "gather_device_facts": handle_gather_device_facts,
     "get_router_list": handle_get_router_list,
     "load_and_commit_config": handle_load_and_commit_config,
+    "execute_junos_pfe_command": handle_execute_pfe_command,
     "add_device": handle_add_device,     # Dynamic device management
     "reload_devices": handle_reload_devices  # Reload devices from a new JSON file
 }
@@ -1691,6 +1764,20 @@ def create_mcp_server() -> Server:
                         "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 360}
                     },
                     "required": ["router_name", "command"]
+                }
+            ),
+            types.Tool(
+                name="execute_junos_pfe_command",
+                description="Execute a Junos command on the router",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "router_name": {"type": "string", "description": "The name of the router"},
+                        "target": {"type": "string", "description": "The PFE target (e.g., fpc0, fpc1, etc.)"},
+                        "command": {"type": "string", "description": "The command to execute on the router"},
+                        "timeout": {"type": "integer", "description": "Command timeout in seconds", "default": 360}
+                    },
+                    "required": ["router_name", "command", "target"]
                 }
             ),
             types.Tool(
