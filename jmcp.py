@@ -1768,7 +1768,7 @@ def create_mcp_server() -> Server:
             ),
             types.Tool(
                 name="execute_junos_pfe_command",
-                description="Execute a Junos command on the router",
+                description="Execute a Junos PFE (Packet Forwarding Engine) command on the router",
                 inputSchema={
                     "type": "object",
                     "properties": {
