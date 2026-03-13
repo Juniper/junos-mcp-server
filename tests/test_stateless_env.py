@@ -35,7 +35,9 @@ class StatelessEnvParsingTests(unittest.TestCase):
             with self.assertLogs("jmcp-server", level="WARNING") as captured:
                 self.assertFalse(get_stateless_with_fallback())
 
-        self.assertTrue(any("Invalid JMCP_STATELESS" in message for message in captured.output))
+        self.assertTrue(
+            any("Invalid JMCP_STATELESS" in message for message in captured.output)
+        )
 
 
 if __name__ == "__main__":

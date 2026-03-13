@@ -3,7 +3,6 @@
 
 import unittest
 
-
 EXAMPLE_REQUEST = {
     "tool": "execute_junos_command_batch",
     "arguments": {

@@ -23,7 +23,9 @@ class BlocklistGuardrailsTests(unittest.TestCase):
     def test_blocks_regex_pattern(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             block_file = Path(tmpdir) / "block.cfg"
-            block_file.write_text("set system login user (.*) authentication\n", encoding="utf-8")
+            block_file.write_text(
+                "set system login user (.*) authentication\n", encoding="utf-8"
+            )
 
             blocked, message = check_config_blocklist(
                 "set system login user automation authentication encrypted-password bar",
@@ -36,7 +38,9 @@ class BlocklistGuardrailsTests(unittest.TestCase):
     def test_blocks_regex_pattern_with_extra_spaces(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             block_file = Path(tmpdir) / "block.cfg"
-            block_file.write_text("set system login user (.*) authentication\n", encoding="utf-8")
+            block_file.write_text(
+                "set system login user (.*) authentication\n", encoding="utf-8"
+            )
 
             blocked, message = check_config_blocklist(
                 "set   system   login user guardx authentication encrypted-password xyz",
@@ -49,7 +53,9 @@ class BlocklistGuardrailsTests(unittest.TestCase):
     def test_blocks_non_space_token_regex_pattern(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             block_file = Path(tmpdir) / "block.cfg"
-            block_file.write_text("set system login user ([^ ]+) authentication\n", encoding="utf-8")
+            block_file.write_text(
+                "set system login user ([^ ]+) authentication\n", encoding="utf-8"
+            )
 
             blocked, message = check_config_blocklist(
                 "set system login user guardx authentication encrypted-password",
@@ -65,6 +71,7 @@ class BlocklistGuardrailsTests(unittest.TestCase):
             try:
                 # Ensure no local block.cfg exists in temporary cwd
                 import os
+
                 os.chdir(tmpdir)
                 blocked, message = check_config_blocklist(
                     "set system login user guardx authentication encrypted-password",
@@ -153,7 +160,6 @@ class CommandBlocklistGuardrailsTests(unittest.TestCase):
 
             self.assertTrue(blocked)
             self.assertIn("not found", message)
-
 
 
 class ToolErrorClassificationTests(unittest.TestCase):
