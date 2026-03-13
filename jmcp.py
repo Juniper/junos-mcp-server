@@ -1734,10 +1734,9 @@ def create_mcp_server() -> Server:
             log.info(f"Created context with request_context: {request_context is not None}")
 
             content_blocks = await handler(arguments, context=context)
-            return types.CallToolResult(content=content_blocks, isError=_is_error_content(content_blocks))
+            return content_blocks
 
-        content_blocks = [types.TextContent(type="text", text=f"Unknown tool: {name}")]
-        return types.CallToolResult(content=content_blocks, isError=True)
+        return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
     @app.list_resources()
     async def list_resources() -> list[types.Resource]:
