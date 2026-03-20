@@ -40,6 +40,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY jmcp.py .
 COPY jmcp_token_manager.py .
 COPY utils/ ./utils/
+COPY block.cmd .
+COPY block.cfg .
 
 # Copy test files
 COPY tests/ ./tests/
