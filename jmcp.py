@@ -1643,7 +1643,7 @@ TOOL_HANDLERS = {
 
 def create_mcp_server() -> Server:
     """Create and configure the MCP server with all tools"""
-    app = Server(JUNOS_MCP, version="1.0.0")
+    app = Server(JUNOS_MCP, version="1.1.0")
     
     @app.call_tool()
     async def call_tool(name: str, arguments: dict) -> types.CallToolResult:
