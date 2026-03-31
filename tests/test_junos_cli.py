@@ -2,11 +2,17 @@
 """Unit tests for CLI helper functions used in Junos command testing."""
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import jmcp
+from tests.test_device_data import get_device
 
 
 def load_devices(devices_file: str) -> bool:
@@ -27,14 +33,7 @@ class JunosCliHelperTests(unittest.TestCase):
         jmcp.devices = self._original_devices
 
     def test_load_devices_success(self):
-        devices = {
-            "router-1": {
-                "ip": "192.168.1.1",
-                "port": 22,
-                "username": "admin",
-                "auth": {"type": "password", "password": "secret123"},
-            }
-        }
+        devices = {"router1": get_device("router1")}
         with tempfile.TemporaryDirectory() as tmpdir:
             file_path = Path(tmpdir) / "devices.json"
             file_path.write_text(json.dumps(devices), encoding="utf-8")

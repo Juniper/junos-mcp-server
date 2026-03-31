@@ -40,11 +40,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY jmcp.py .
 COPY jmcp_token_manager.py .
 COPY utils/ ./utils/
+COPY block.cmd .
+COPY block.cfg .
 
 # Copy test files
-COPY test_config_validation.py .
-COPY test_invalid_devices.json .
-COPY test_junos_cli.py .
+COPY tests/ ./tests/
 
 # Copy configuration files
 # COPY devices.json /app/config/devices.json

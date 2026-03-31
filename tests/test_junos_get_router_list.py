@@ -2,10 +2,17 @@
 """Unit tests for handle_get_router_list() and data redaction."""
 
 import json
+import sys
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import jmcp
+from tests.test_device_data import get_device
 
 
 class GetRouterListTests(unittest.IsolatedAsyncioTestCase):
@@ -24,45 +31,29 @@ class GetRouterListTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_password_and_ssh_key_redaction(self):
         jmcp.devices = {
-            "router-1": {
-                "ip": "192.168.1.1",
-                "port": 22,
-                "username": "admin",
-                "auth": {"type": "password", "password": "secret123"},
-            },
-            "router-2": {
-                "ip": "192.168.1.2",
-                "port": 22,
-                "username": "admin",
-                "auth": {"type": "ssh_key", "private_key_path": "/path/to/key.pem"},
-            },
+            "router1": get_device("router1"),
+            "router2": get_device("router2"),
         }
 
         result = await jmcp.handle_get_router_list({}, self.context)
         output = json.loads(result[0].text)
 
-        self.assertEqual(output["router-1"]["auth"]["type"], "password")
-        self.assertNotIn("password", output["router-1"]["auth"])
+        self.assertEqual(output["router1"]["auth"]["type"], "password")
+        self.assertNotIn("password", output["router1"]["auth"])
 
-        self.assertEqual(output["router-2"]["auth"]["type"], "ssh_key")
-        self.assertNotIn("private_key_path", output["router-2"]["auth"])
+        self.assertEqual(output["router2"]["auth"]["type"], "ssh_key")
+        self.assertNotIn("private_key_path", output["router2"]["auth"])
 
     async def test_ssh_config_removed_and_custom_fields_kept(self):
-        jmcp.devices = {
-            "router-3": {
-                "ip": "192.168.1.3",
-                "port": 22,
-                "username": "admin",
-                "ssh_config": "/home/user/.ssh/config_jumphost",
-                "role": "pe",
-                "group": "ISP",
-                "auth": {"type": "password", "password": "secret123"},
-            }
-        }
+        router = get_device("router3")
+        router["ssh_config"] = "/home/user/.ssh/config_jumphost"
+        router["role"] = "pe"
+        router["group"] = "ISP"
+        jmcp.devices = {"router3": router}
 
         result = await jmcp.handle_get_router_list({}, self.context)
         output = json.loads(result[0].text)
-        router = output["router-3"]
+        router = output["router3"]
 
         self.assertNotIn("ssh_config", router)
         self.assertEqual(router["role"], "pe")
@@ -70,14 +61,7 @@ class GetRouterListTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("password", router["auth"])
 
     async def test_json_pretty_and_source_immutability(self):
-        jmcp.devices = {
-            "test-router": {
-                "ip": "10.0.0.1",
-                "port": 22,
-                "username": "test",
-                "auth": {"type": "password", "password": "test123"},
-            }
-        }
+        jmcp.devices = {"router1": get_device("router1")}
         before = json.dumps(jmcp.devices, sort_keys=True)
 
         result = await jmcp.handle_get_router_list({}, self.context)
@@ -89,7 +73,7 @@ class GetRouterListTests(unittest.IsolatedAsyncioTestCase):
 
         after = json.dumps(jmcp.devices, sort_keys=True)
         self.assertEqual(before, after)
-        self.assertIn("password", jmcp.devices["test-router"]["auth"])
+        self.assertIn("password", jmcp.devices["router1"]["auth"])
 
 
 if __name__ == "__main__":

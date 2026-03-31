@@ -1,4 +1,4 @@
-.PHONY: test test-all test-config test-router-list test-batch-command test-discover test-unit build check-compile docker-build docker-build-no-cache help clean
+.PHONY: test test-all test-discover test-unit build check-compile docker-build docker-build-no-cache help clean
 
 # Default target
 help:
@@ -7,9 +7,6 @@ help:
 	@echo "  make test-all            - Run all tests (alias for test)"
 	@echo "  make test-discover       - Run full unittest discovery"
 	@echo "  make test-unit           - Run unittest discovery (verbose)"
-	@echo "  make test-config         - Run config validation tests only"
-	@echo "  make test-router-list    - Run get_router_list tests only"
-	@echo "  make test-batch-command  - Run batch command tests only"
 	@echo "  make build               - Run Python compile checks"
 	@echo "  make check-compile       - Byte-compile Python files (syntax check)"
 	@echo "  make docker-build        - Build Docker image"
@@ -27,7 +24,7 @@ build: check-compile
 # Python compile check (catches syntax/compile-time errors)
 check-compile:
 	@echo "Running Python compile checks..."
-	@uv run python -m compileall -q jmcp.py jmcp_token_manager.py utils test test_*.py
+	@uv run python -m compileall -q jmcp.py jmcp_token_manager.py utils tests
 
 
 # Run full unittest discovery
@@ -40,23 +37,10 @@ test: test-discover
 # Explicit alias for full discovery
 test-discover:
 	@echo "Running full unittest discovery..."
-	@uv run python -m unittest discover -v
+	@uv run python -m unittest discover -s tests -v
 
 # Backward-compatible alias
 test-unit: test-discover
-
-# Legacy targeted tests (kept for convenience)
-test-config:
-	@echo "Running config validation tests..."
-	@uv run python test_config_validation.py
-
-test-router-list:
-	@echo "Running get_router_list tests..."
-	@uv run python test_get_router_list.py
-
-test-batch-command:
-	@echo "Running batch command tests..."
-	@uv run python test_batch_command.py
 
 
 # Alias for test
