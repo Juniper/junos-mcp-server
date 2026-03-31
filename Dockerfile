@@ -4,7 +4,7 @@ FROM python:3.11-slim
 # Set metadata
 LABEL maintainer="Nilesh Simaria"
 LABEL description="Junos MCP Server"
-LABEL version="1.0"
+LABEL version="1.1.0"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
