@@ -80,39 +80,6 @@ devices = {}
 JUNOS_MCP = "jmcp-server"
 
 
-# ==============================
-# Telemetry Influx YAML Template
-# ==============================
-INFLOW_TELEMETRY_YAML_TEMPLATE = """\
-influx:
-  url: "{{ influx.url }}"
-  token: "{{ influx.token }}"
-  org: "{{ influx.org }}"
-  bucket: "{{ influx.bucket }}"
-
-compare_results: {{ compare_results | lower }}
-
-queries:
-{% for q in queries %}
-  - name: {{ q.name }}
-    query: |
-{{ q.query | indent(6) }}
-    raw_csv: "{{ q.raw_csv }}"
-    output_csv: "{{ q.output_csv }}"
-{% endfor %}
-
-csv:
-  drop_columns:
-{% for col in csv.drop_columns %}
-    - {{ col }}
-{% endfor %}
-
-  desired_columns_order:
-{% for col in csv.desired_columns_order %}
-    - {{ col }}
-{% endfor %}
-"""
-
 class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
     """Context object providing access to MCP capabilities.
 
@@ -703,185 +670,6 @@ def _run_junos_cli_command(router_name: str, command: str, timeout: int = 360) -
     except Exception as e:
         return f"An error occurred: {e}"
 
-def _run_device_command(device_name: str, command: str, timeout: int) -> str:
-    device_info = devices.get(device_name)
-    if not device_info:
-        return f"Device '{device_name}' not found in inventory."
-
-    device_type = device_info.get("type", "junos").lower()
-
-    if device_type == "junos":
-        return _run_junos_cli_command(device_name, command, timeout)
-
-    elif device_type == "linux":
-        return _run_linux_command(device_name, command, timeout)
-
-    else:
-        return f"Unsupported device type '{device_type}' for device '{device_name}'."
-
-def _run_linux_command(host_name: str, command: str, timeout: int = 360) -> str:
-    """Internal helper to connect and run a linux host command."""
-    log.debug(
-        "Executing command %s on host %s with timeout %ss (internal)",
-        command,
-        host_name,
-        timeout,
-    )
-    host_info = devices[host_name]
-
-    import paramiko
-
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    try:
-        auth = host_info.get("auth", {})
-        if auth.get("type") == "password":
-            ssh.connect(
-                hostname=host_info["ip"],
-                username=host_info["username"],
-                password=auth.get("password"),
-                timeout=10,
-            )
-        else:
-            ssh.connect(
-                hostname=host_info["ip"],
-                username=host_info["username"],
-                key_filename=host_info["auth"]["private_key_path"],
-                timeout=10,
-            )
-        stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
-
-        out = stdout.read().decode().strip()
-        err = stderr.read().decode().strip()
-
-        return out or err or "Command executed successfully"
-    except Exception as e:
-        return f"Linux error: {e}"
-    finally:
-        ssh.close()
-
-def _fetch_influx_credentials(device_name: str) -> dict:
-    """
-    Fetch and validate InfluxDB credentials from the Linux host.
-    """
-    command = "cat /usr/local/bin/influx_credentials.yaml"
-    output = _run_linux_command(device_name, command)
-    import yaml
-
-    try:
-        influx = yaml.safe_load(output)
-    except Exception as e:
-        raise ValueError(f"Failed to parse Influx credentials YAML: {e}")
-    if not isinstance(influx, dict):
-        raise ValueError("Influx credentials file is not valid YAML mapping")
-    required_keys = {"url", "token", "org", "bucket"}
-    missing = required_keys - influx.keys()
-
-    if missing:
-        raise ValueError(
-            f"Influx credentials missing required keys: {', '.join(missing)}"
-        )
-    return influx
-
-from jinja2 import Environment
-
-
-def _run_telemetry_influx(
-    device_name: str,
-    query_blocks: list[dict],
-    compare_results: bool = True,
-    config_name: str = "telemetry_config.yaml",
-):
-    # Fetch secrets from host
-    influx = _fetch_influx_credentials(device_name)
-
-    # Constant CSV config
-    csv_config = {
-        "drop_columns": [
-            "result", "table", "_start", "_stop", "Unnamed: 0",
-            "device", "host", "source", "sub_component_id", "uuid"
-        ],
-        "desired_columns_order": [
-            "_measurement", "path", "name", "_field", "_value",
-            "received_time", "producer_time", "delays_ms"
-        ]
-    }
-
-    env = Environment()
-    template = env.from_string(INFLOW_TELEMETRY_YAML_TEMPLATE)
-
-    yaml_content = template.render(
-        influx=influx,
-        queries=query_blocks,
-        compare_results=compare_results,
-        csv=csv_config,
-    )
-
-#    remote_dir = "/tmp/mcp-influx"
-#    config_path = f"{remote_dir}/{config_name}"
-
-#    shell_cmd = f"""
-#mkdir -p {remote_dir} &&
-#cat <<'EOF' > {config_path}
-#{yaml_content}
-#EOF
-#python3 /app/utils/influx/telemetryInfluxProcessor.py {config_path}
-#"""
-#    is_blocked, blocked_message = check_command_blocklist(shell_cmd)
-#    if is_blocked:
-#        return blocked_message
-
-#    return _run_linux_command(device_name, shell_cmd)
-
-    local_dir = "/tmp/mcp-influx"
-    os.makedirs(local_dir, exist_ok=True)
-    config_path = f"{local_dir}/{config_name}"
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.write(yaml_content)
-    # Step 5: Run processor LOCALLY
-    return _run_telemetry_influx_local(config_path)
-
-
-import subprocess
-
-# ✅ Define allowed processors at module level
-ALLOWED_TELEMETRY_PROCESSORS = {
-    "/app/utils/influx/telemetryInfluxProcessor.py",
-}
-
-def _run_telemetry_influx_local(config_path: str) -> str:
-    """
-    Run telemetryInfluxProcessor locally inside the MCP container.
-    """
-    processor_path = "/app/utils/influx/telemetryInfluxProcessor.py"
-
-    if processor_path not in ALLOWED_TELEMETRY_PROCESSORS:
-        raise RuntimeError(
-            f"Unauthorized telemetry processor: {processor_path}"
-        )
-
-    cmd = [
-        "python3",
-        "/app/utils/influx/telemetryInfluxProcessor.py",
-#        "--config",
-        config_path,
-    ]
-
-    try:
-        completed = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return completed.stdout or "Telemetry processor executed successfully"
-    except subprocess.CalledProcessError as e:
-        return (
-            "Telemetry processor failed:\n"
-            f"STDOUT:\n{e.stdout}\n\n"
-            f"STDERR:\n{e.stderr}"
-        )
 
 def _run_junos_pfe_command(
     router_name: str, target: str, command: str, timeout: int = 360
@@ -1191,7 +979,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-async def H_ANDLE_execute_junos_command(
+async def handle_execute_junos_command(
     arguments: dict, context: Context
 ) -> list[types.ContentBlock]:
     """Handler for execute_junos_command tool"""
@@ -1234,108 +1022,6 @@ async def H_ANDLE_execute_junos_command(
     log.debug("content block: %s", content_block)
     return [content_block]
 
-async def handle_run_telemetry_influx(
-    arguments: dict,
-    context: Context,
-):
-    device_name = arguments["device_name"]
-    queries = arguments["queries"]
-    compare_results = arguments.get("compare_results", True)
-
-    result = _run_telemetry_influx(
-        device_name=device_name,
-        query_blocks=queries,
-        compare_results=compare_results,
-    )
-
-    return [types.TextContent(type="text", text=result)]
-
-async def handle_execute_junos_command(
-    arguments: dict,
-    context: Context,
-) -> list[types.ContentBlock]:
-    # Backward-compatibility wrapper
-    router_name = arguments.get("router_name", "")
-    device_info = devices.get(router_name)
-
-    if not device_info:
-        return [types.TextContent(type="text",
-            text=f"Device '{router_name}' not found.")]
-
-    if device_info.get("type", "junos") != "junos":
-        return [types.TextContent(
-            type="text",
-            text=(
-                "execute_junos_command is only supported for Junos devices. "
-                f"Device '{router_name}' is of type '{device_info.get('type')}'."
-            ),
-        )]
-
-    arguments["device_name"] = arguments.pop("router_name", "")
-    return await handle_execute_device_command(arguments, context)
-
-async def handle_execute_linux_command(
-    arguments: dict,
-    context: Context,
-) -> list[types.ContentBlock]:
-    """
-    Explicit Linux-only execution tool.
-    Internally delegates to execute_device_command.
-    """
-    device_name = arguments.get("device_name", "")
-    device_info = devices.get(device_name)
-
-    if not device_info:
-        return [types.TextContent(
-            type="text",
-            text=f"Device '{device_name}' not found."
-        )]
-
-    if device_info.get("type") != "linux":
-        return [types.TextContent(
-            type="text",
-            text=(
-                "execute_linux_command can only be used for Linux devices. "
-                f"Device '{device_name}' is of type '{device_info.get('type')}'."
-            ),
-        )]
-
-    # Delegate to the generic path
-    return await handle_execute_device_command(arguments, context)
-
-async def handle_execute_device_command(
-    arguments: dict,
-    context: Context,
-) -> list[types.ContentBlock]:
-    start_time = time.time()
-    start_timestamp = datetime.now(timezone.utc).isoformat()
-
-    device_name = arguments.get("device_name", "")
-    command = arguments.get("command", "")
-    timeout = get_timeout_with_fallback(arguments.get("timeout"))
-
-    is_blocked, blocked_message = check_command_blocklist(command)
-    if is_blocked:
-        result = blocked_message
-    elif device_name not in devices:
-        result = f"Device {device_name} not found in the device mapping."
-    else:
-        result = _run_device_command(device_name, command, timeout)
-
-    end_time = time.time()
-    execution_duration = round(end_time - start_time, 3)
-
-    return [
-        types.TextContent(
-            type="text",
-            text=result,
-            annotations={
-                "device_name": device_name,
-                "command": command,
-                "execution_duration": execution_duration,
-            },
-        )
-    ]
 
 async def handle_execute_junos_command_batch(
     arguments: dict, context: Context
@@ -1392,21 +1078,6 @@ async def handle_execute_junos_command_batch(
 
     # Validate all routers exist before executing - prevents partial failures
     invalid_routers = [r for r in router_names if r not in devices]
-
-    non_junos = [
-        r for r in router_names
-        if devices[r].get("type", "junos") != "junos"
-    ]
-
-    if non_junos:
-        return [types.TextContent(
-            type="text",
-            text=(
-                "execute_junos_command_batch is only supported for Junos devices. "
-                f"Invalid devices: {', '.join(non_junos)}"
-            ),
-        )]
-
     if invalid_routers:
         return [
             types.TextContent(
@@ -1608,14 +1279,9 @@ async def handle_get_junos_config(
 ) -> list[types.ContentBlock]:
     """Handler for get_junos_config tool"""
     router_name = arguments.get("router_name", "")
-    device_info = devices.get(router_name)
-    if not device_info:
-        result = f"Device {router_name} not found."
-    elif device_info.get("type", "junos") != "junos":
-        result = (
-            "get_junos_config is only supported for Junos devices. "
-            f"Device '{router_name}' is of type '{device_info.get('type')}'."
-        )
+
+    if router_name not in devices:
+        result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug("Getting configuration from router %s", router_name)
         result = _run_junos_cli_command(
@@ -1636,15 +1302,10 @@ async def handle_junos_config_diff(
 ) -> list[types.ContentBlock]:
     """Handler for junos_config_diff tool"""
     router_name = arguments.get("router_name", "")
-    device_info = devices.get(router_name)
     version = arguments.get("version", 1)
-    if not device_info:
-        result = f"Device {router_name} not found."
-    elif device_info.get("type", "junos") != "junos":
-        result = (
-            "get_junos_config is only supported for Junos devices. "
-            f"Device '{router_name}' is of type '{device_info.get('type')}'."
-        )
+
+    if router_name not in devices:
+        result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug(
             "Getting configuration diff from router %s for version %s",
@@ -1715,20 +1376,6 @@ async def handle_render_and_apply_j2_template(
     # Handle single router_name or list of router_names
     if router_name and not router_names:
         router_names = [router_name]
-
-    non_junos = [
-        r for r in router_names
-        if devices.get(r, {}).get("type", "junos") != "junos"
-    ]
-
-    if non_junos:
-        return [types.TextContent(
-            type="text",
-            text=(
-                "render_and_apply_j2_template is only supported for Junos devices. "
-                f"Invalid devices: {', '.join(non_junos)}"
-            ),
-        )]
 
     # Step 2: Load variables from YAML string
     try:
@@ -2020,22 +1667,6 @@ async def handle_gather_device_facts(
 ) -> list[types.ContentBlock]:
     """Handler for gather_device_facts tool"""
     router_name = arguments.get("router_name", "")
-    device_info = devices.get(router_name)
-    if not device_info:
-        return [types.TextContent(
-            type="text",
-            text=f"Device '{router_name}' not found."
-        )]
-
-    if device_info.get("type", "junos") != "junos":
-        return [types.TextContent(
-            type="text",
-            text=(
-                "gather_device_facts is only supported for Junos devices. "
-                f"Device '{router_name}' is of type '{device_info.get('type')}'."
-            ),
-        )]
-
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
 
     if router_name not in devices:
@@ -2171,31 +1802,13 @@ async def handle_get_router_list(
 async def handle_execute_pfe_command(
     arguments: dict, context: Context
 ) -> list[types.ContentBlock]:
-
+    """Handler for execute_pfe_command tool"""
+    start_time = time.time()
+    start_timestamp = datetime.now(timezone.utc).isoformat()
     router_name = arguments.get("router_name", "")
     target = arguments.get("target", "")
     command = arguments.get("command", "")
     timeout = get_timeout_with_fallback(arguments.get("timeout"))
-
-    device_info = devices.get(router_name)
-    if not device_info:
-        return [types.TextContent(
-            type="text",
-            text=f"Device '{router_name}' not found in inventory.",
-        )]
-
-    if device_info.get("type", "junos") != "junos":
-        return [types.TextContent(
-            type="text",
-            text=(
-                "PFE commands are supported only on Junos devices. "
-                f"Device '{router_name}' is of type '{device_info.get('type')}'."
-            ),
-        )]
-
-    """Handler for execute_pfe_command tool"""
-    start_time = time.time()
-    start_timestamp = datetime.now(timezone.utc).isoformat()
 
     is_blocked, blocked_message = check_command_blocklist(command)
     if is_blocked:
@@ -2257,21 +1870,6 @@ async def handle_load_and_commit_config(
 ) -> list[types.ContentBlock]:
     """Handler for load_and_commit_config tool"""
     router_name = arguments.get("router_name", "")
-    device_info = devices.get(router_name)
-    if not device_info:
-        return [types.TextContent(
-            type="text",
-            text=f"Device '{router_name}' not found."
-        )]
-
-    if device_info.get("type", "junos") != "junos":
-        return [types.TextContent(
-            type="text",
-            text=(
-                "load_and_commit_config is only supported for Junos devices. "
-                f"Device '{router_name}' is of type '{device_info.get('type')}'."
-            ),
-        )]
     config_text = arguments.get("config_text", arguments.get("config", ""))
     config_format = arguments.get("config_format", "set")
     commit_comment = arguments.get("commit_comment", "Configuration loaded via MCP")
@@ -2280,6 +1878,8 @@ async def handle_load_and_commit_config(
     is_blocked, blocked_message = check_config_blocklist(config_text)
     if is_blocked:
         result = blocked_message
+    elif router_name not in devices:
+        result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug(
             "Loading and committing config on router %s with format %s",
@@ -2400,10 +2000,7 @@ def _is_error_content(content_blocks: list[types.ContentBlock]) -> bool:
 # 2. Add it to this registry: "my_new_tool": handle_my_new_tool
 # 3. Add the tool definition to list_tools() method
 TOOL_HANDLERS = {
-    "run_telemetry_influx": handle_run_telemetry_influx,
-    "execute_linux_command": handle_execute_linux_command,
     "execute_junos_command": handle_execute_junos_command,
-    "execute_device_command": handle_execute_device_command,
     "execute_junos_command_batch": handle_execute_junos_command_batch,
     "get_junos_config": handle_get_junos_config,
     "junos_config_diff": handle_junos_config_diff,
@@ -2459,28 +2056,6 @@ def create_mcp_server() -> Server:
     async def list_tools() -> list[types.Tool]:
         """List available tools"""
         return [
-            types.Tool(
-                name="execute_linux_command",
-                description="Execute a shell command on a Linux host",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "device_name": {
-                            "type": "string",
-                            "description": "Linux host name"
-                        },
-                        "command": {
-                            "type": "string",
-                            "description": "Shell command to execute"
-                        },
-                        "timeout": {
-                            "type": "integer",
-                            "default": 360
-                        }
-                    },
-                    "required": ["device_name", "command"]
-                }
-            ),
             types.Tool(
                 name="execute_junos_command",
                 description="Execute a Junos command on the router",
@@ -2740,31 +2315,6 @@ def create_mcp_server() -> Server:
                     "required": ["file_name"],
                 },
             ),
-            types.Tool(
-              name="run_telemetry_influx",
-              description="Run telemetryInfluxProcessor using host-local Influx credentials and supplied queries",
-              inputSchema={
-                "type": "object",
-                "properties": {
-                  "device_name": {"type": "string"},
-                  "compare_results": {"type": "boolean"},
-                  "queries": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "name": {"type": "string"},
-                        "query": {"type": "string"},
-                        "raw_csv": {"type": "string"},
-                        "output_csv": {"type": "string"}
-                      },
-                      "required": ["name", "query", "raw_csv", "output_csv"]
-                    }
-                  }
-                },
-                "required": ["device_name", "queries"]
-              }
-            )
         ]
 
     return app

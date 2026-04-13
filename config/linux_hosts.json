@@ -1,0 +1,63 @@
+{
+    "mgmtha0": {
+        "ip": "10.48.17.193",
+        "port": 22,
+        "username": "root",
+        "auth": {
+            "type": "password",
+            "password": "Embe1mpls"
+        },
+        "metadata": {
+            "environment": "ccl-prod",
+            "role": "orion",
+            "owner": "vijayc",
+            "os": "ubuntu-22.04"
+        }
+    },
+    "ondetra1a": {
+        "ip": "10.48.17.190",
+        "port": 22,
+        "username": "root",
+        "auth": {
+            "type": "password",
+            "password": "Embe1mpls"
+        },
+        "metadata": {
+            "environment": "ccl-prod",
+            "role": "non-mgmtha",
+            "owner": "vijayc",
+            "os": "ubuntu-22.04"
+        }
+    },
+    "mgmtha1": {
+        "ip": "10.48.47.65",
+        "port": 22,
+        "username": "ccl",
+        "auth": {
+            "type": "password",
+            "password": "juniper123"
+        },
+        "metadata": {
+            "environment": "ccl-prod",
+            "role": "pictor1",
+            "owner": "vijayc",
+            "os": "ubuntu-22.04"
+        }
+    },
+    "mgmtha2": {
+        "ip": "10.48.47.63",
+        "port": 22,
+        "username": "ccl",
+        "auth": {
+            "type": "password",
+            "password": "juniper123"
+        },
+        "metadata": {
+            "environment": "ccl-prod",
+            "role": "pictor2",
+            "owner": "vijayc",
+            "os": "ubuntu-22.04"
+        }
+    }
+}
+

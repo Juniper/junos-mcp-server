@@ -3,8 +3,8 @@ FROM python:3.11-slim
 
 # Set metadata
 LABEL maintainer="Nilesh Simaria"
-LABEL description="Junos MCP Server"
-LABEL version="1.1.0"
+LABEL description="Junos MCP Server + Linux Hosts + Influx Processing"
+LABEL version="1.1.1"
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
@@ -36,10 +36,15 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+
+# ✅ CREATE NON-ROOT USER EARLY
+RUN groupadd -r jmcp && useradd -r -g jmcp -s /bin/bash jmcp
+
 # Copy the main application and utils module
 COPY jmcp.py .
 COPY jmcp_token_manager.py .
 COPY utils/ ./utils/
+RUN chown -R jmcp:jmcp /app/utils
 COPY block.cmd .
 COPY block.cfg .
 
@@ -48,9 +53,6 @@ COPY tests/ ./tests/
 
 # Copy configuration files
 # COPY devices.json /app/config/devices.json
-
-# Create a non-root user for security
-RUN groupadd -r jmcp && useradd -r -g jmcp -s /bin/bash jmcp
 
 # Set ownership and permissions
 RUN chown -R jmcp:jmcp /app
@@ -67,4 +69,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import psutil; exit(0 if psutil.Process().is_running() else 1)"
 
 # Default command
-CMD ["python", "jmcp.py", "-f", "/app/config/devices.json", "-t", "stdio"]
+#CMD ["python", "jmcp.py"]
+CMD ["python", "jmcp.py", "--transport", "streamable-http", "--port", "30030"]

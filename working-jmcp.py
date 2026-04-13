@@ -80,39 +80,6 @@ devices = {}
 JUNOS_MCP = "jmcp-server"
 
 
-# ==============================
-# Telemetry Influx YAML Template
-# ==============================
-INFLOW_TELEMETRY_YAML_TEMPLATE = """\
-influx:
-  url: "{{ influx.url }}"
-  token: "{{ influx.token }}"
-  org: "{{ influx.org }}"
-  bucket: "{{ influx.bucket }}"
-
-compare_results: {{ compare_results | lower }}
-
-queries:
-{% for q in queries %}
-  - name: {{ q.name }}
-    query: |
-{{ q.query | indent(6) }}
-    raw_csv: "{{ q.raw_csv }}"
-    output_csv: "{{ q.output_csv }}"
-{% endfor %}
-
-csv:
-  drop_columns:
-{% for col in csv.drop_columns %}
-    - {{ col }}
-{% endfor %}
-
-  desired_columns_order:
-{% for col in csv.desired_columns_order %}
-    - {{ col }}
-{% endfor %}
-"""
-
 class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
     """Context object providing access to MCP capabilities.
 
@@ -761,128 +728,6 @@ def _run_linux_command(host_name: str, command: str, timeout: int = 360) -> str:
     finally:
         ssh.close()
 
-def _fetch_influx_credentials(device_name: str) -> dict:
-    """
-    Fetch and validate InfluxDB credentials from the Linux host.
-    """
-    command = "cat /usr/local/bin/influx_credentials.yaml"
-    output = _run_linux_command(device_name, command)
-    import yaml
-
-    try:
-        influx = yaml.safe_load(output)
-    except Exception as e:
-        raise ValueError(f"Failed to parse Influx credentials YAML: {e}")
-    if not isinstance(influx, dict):
-        raise ValueError("Influx credentials file is not valid YAML mapping")
-    required_keys = {"url", "token", "org", "bucket"}
-    missing = required_keys - influx.keys()
-
-    if missing:
-        raise ValueError(
-            f"Influx credentials missing required keys: {', '.join(missing)}"
-        )
-    return influx
-
-from jinja2 import Environment
-
-
-def _run_telemetry_influx(
-    device_name: str,
-    query_blocks: list[dict],
-    compare_results: bool = True,
-    config_name: str = "telemetry_config.yaml",
-):
-    # Fetch secrets from host
-    influx = _fetch_influx_credentials(device_name)
-
-    # Constant CSV config
-    csv_config = {
-        "drop_columns": [
-            "result", "table", "_start", "_stop", "Unnamed: 0",
-            "device", "host", "source", "sub_component_id", "uuid"
-        ],
-        "desired_columns_order": [
-            "_measurement", "path", "name", "_field", "_value",
-            "received_time", "producer_time", "delays_ms"
-        ]
-    }
-
-    env = Environment()
-    template = env.from_string(INFLOW_TELEMETRY_YAML_TEMPLATE)
-
-    yaml_content = template.render(
-        influx=influx,
-        queries=query_blocks,
-        compare_results=compare_results,
-        csv=csv_config,
-    )
-
-#    remote_dir = "/tmp/mcp-influx"
-#    config_path = f"{remote_dir}/{config_name}"
-
-#    shell_cmd = f"""
-#mkdir -p {remote_dir} &&
-#cat <<'EOF' > {config_path}
-#{yaml_content}
-#EOF
-#python3 /app/utils/influx/telemetryInfluxProcessor.py {config_path}
-#"""
-#    is_blocked, blocked_message = check_command_blocklist(shell_cmd)
-#    if is_blocked:
-#        return blocked_message
-
-#    return _run_linux_command(device_name, shell_cmd)
-
-    local_dir = "/tmp/mcp-influx"
-    os.makedirs(local_dir, exist_ok=True)
-    config_path = f"{local_dir}/{config_name}"
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.write(yaml_content)
-    # Step 5: Run processor LOCALLY
-    return _run_telemetry_influx_local(config_path)
-
-
-import subprocess
-
-# ✅ Define allowed processors at module level
-ALLOWED_TELEMETRY_PROCESSORS = {
-    "/app/utils/influx/telemetryInfluxProcessor.py",
-}
-
-def _run_telemetry_influx_local(config_path: str) -> str:
-    """
-    Run telemetryInfluxProcessor locally inside the MCP container.
-    """
-    processor_path = "/app/utils/influx/telemetryInfluxProcessor.py"
-
-    if processor_path not in ALLOWED_TELEMETRY_PROCESSORS:
-        raise RuntimeError(
-            f"Unauthorized telemetry processor: {processor_path}"
-        )
-
-    cmd = [
-        "python3",
-        "/app/utils/influx/telemetryInfluxProcessor.py",
-#        "--config",
-        config_path,
-    ]
-
-    try:
-        completed = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        return completed.stdout or "Telemetry processor executed successfully"
-    except subprocess.CalledProcessError as e:
-        return (
-            "Telemetry processor failed:\n"
-            f"STDOUT:\n{e.stdout}\n\n"
-            f"STDERR:\n{e.stderr}"
-        )
-
 def _run_junos_pfe_command(
     router_name: str, target: str, command: str, timeout: int = 360
 ):
@@ -1233,22 +1078,6 @@ async def H_ANDLE_execute_junos_command(
     )
     log.debug("content block: %s", content_block)
     return [content_block]
-
-async def handle_run_telemetry_influx(
-    arguments: dict,
-    context: Context,
-):
-    device_name = arguments["device_name"]
-    queries = arguments["queries"]
-    compare_results = arguments.get("compare_results", True)
-
-    result = _run_telemetry_influx(
-        device_name=device_name,
-        query_blocks=queries,
-        compare_results=compare_results,
-    )
-
-    return [types.TextContent(type="text", text=result)]
 
 async def handle_execute_junos_command(
     arguments: dict,
@@ -2400,7 +2229,6 @@ def _is_error_content(content_blocks: list[types.ContentBlock]) -> bool:
 # 2. Add it to this registry: "my_new_tool": handle_my_new_tool
 # 3. Add the tool definition to list_tools() method
 TOOL_HANDLERS = {
-    "run_telemetry_influx": handle_run_telemetry_influx,
     "execute_linux_command": handle_execute_linux_command,
     "execute_junos_command": handle_execute_junos_command,
     "execute_device_command": handle_execute_device_command,
@@ -2740,31 +2568,6 @@ def create_mcp_server() -> Server:
                     "required": ["file_name"],
                 },
             ),
-            types.Tool(
-              name="run_telemetry_influx",
-              description="Run telemetryInfluxProcessor using host-local Influx credentials and supplied queries",
-              inputSchema={
-                "type": "object",
-                "properties": {
-                  "device_name": {"type": "string"},
-                  "compare_results": {"type": "boolean"},
-                  "queries": {
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "name": {"type": "string"},
-                        "query": {"type": "string"},
-                        "raw_csv": {"type": "string"},
-                        "output_csv": {"type": "string"}
-                      },
-                      "required": ["name", "query", "raw_csv", "output_csv"]
-                    }
-                  }
-                },
-                "required": ["device_name", "queries"]
-              }
-            )
         ]
 
     return app

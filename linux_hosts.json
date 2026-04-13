@@ -1,0 +1,39 @@
+{
+    "cn1": {
+        "ip": "10.48.17.193",
+        "port": 22,
+        "username": "root",
+        "auth": {
+            "type": "password",
+            "password": "Embe1mpls"
+        }
+    },
+    "ond1": {
+        "ip": "10.48.17.190",
+        "port": 22,
+        "username": "root",
+        "auth": {
+            "type": "password",
+            "password": "Embe1mpls"
+        }
+    },
+    "mgmtha1": {
+        "ip": "10.48.47.65",
+        "port": 22,
+        "username": "ccl",
+        "auth": {
+            "type": "password",
+            "password": "juniper123"
+        }
+    },
+    "mgmtha2": {
+        "ip": "10.48.47.63",
+        "port": 22,
+        "username": "ccl",
+        "auth": {
+            "type": "password",
+            "password": "juniper123"
+        }
+    }
+}
+

@@ -9,65 +9,63 @@ log = logging.getLogger("jmcp-server.config")
 
 
 def validate_device_config(device_name: str, device_config: Dict[str, Any]) -> None:
-    """Validate device configuration has all required fields
-
-    Args:
-        device_name: Name of the device
-        device_config: Device configuration dictionary
-
-    Raises:
-        ValueError: If required fields are missing or invalid
-    """
-    # Check required top-level fields
-    required_fields = ["ip", "port", "username"]
-    missing_fields = [field for field in required_fields if field not in device_config]
-
+    """Validate device configuration has all required fields"""
+    # ---- Required top-level fields ----
+    required_fields = ["ip", "username"]
+    missing_fields = [f for f in required_fields if f not in device_config]
     if missing_fields:
         raise ValueError(
-            f"Device '{device_name}' missing required fields: {', '.join(missing_fields)}. "
-            f"Expected format: {{'ip': 'x.x.x.x', 'port': 22, 'username': 'user', 'auth': {{...}}}}"
+            f"Device '{device_name}' missing required fields: {', '.join(missing_fields)}"
         )
-
-    # Validate authentication configuration
-    if "auth" in device_config:
-        auth_config = device_config["auth"]
-        if "type" not in auth_config:
+    # Default port normalization
+    if "port" not in device_config:
+        device_config["port"] = 22
+    if not isinstance(device_config["port"], int):
+        raise ValueError(
+            f"Device '{device_name}' has invalid port type "
+            f"({type(device_config['port']).__name__}); expected int"
+        )
+    # ---- Device type ----
+    device_type = device_config.get("type", "junos").lower()
+    if device_type not in {"junos", "linux"}:
+        raise ValueError(
+            f"Device '{device_name}' has unsupported type '{device_type}'"
+        )
+    # ---- Auth validation ----
+    if "auth" not in device_config:
+        raise ValueError(
+            f"Device '{device_name}' missing auth configuration"
+        )
+    auth = device_config["auth"]
+    if "type" not in auth:
+        raise ValueError(
+            f"Device '{device_name}' auth section missing 'type'"
+        )
+    auth_type = auth["type"]
+    if auth_type == "password":
+        if "password" not in auth:
             raise ValueError(
-                f"Device '{device_name}' has 'auth' section but missing 'type' field. "
-                f"Expected 'type' to be either 'password' or 'ssh_key'"
+                f"Device '{device_name}' auth type is 'password' "
+                f"but 'password' field is missing"
+            )
+        # Enforce Junos restriction
+        if device_type == "junos":
+            log.warning(
+                "Device '%s' is Junos using password authentication; "
+                "this is discouraged and may fail depending on Junos/NETCONF settings",
+                device_name,
             )
 
-        if auth_config["type"] == "password":
-            if "password" not in auth_config:
-                raise ValueError(
-                    f"Device '{device_name}' auth type is 'password' "
-                    "but 'password' field is missing"
-                )
-        elif auth_config["type"] == "ssh_key":
-            if "private_key_path" not in auth_config:
-                raise ValueError(
-                    f"Device '{device_name}' auth type is 'ssh_key' "
-                    "but 'private_key_path' field is missing"
-                )
-        else:
+    elif auth_type == "ssh_key":
+        if "private_key_path" not in auth:
             raise ValueError(
-                f"Device '{device_name}' has unsupported auth type '{auth_config['type']}'. "
-                f"Supported types are: 'password', 'ssh_key'"
+                f"Device '{device_name}' auth type is 'ssh_key' "
+                f"but 'private_key_path' is missing"
             )
-    elif "password" not in device_config:
-        # No auth section and no password field (backward compatibility check)
+    else:
         raise ValueError(
-            f"Device '{device_name}' missing authentication configuration. "
-            f"Either provide 'auth' section or 'password' field (deprecated)"
+            f"Device '{device_name}' has unsupported auth type '{auth_type}'"
         )
-
-    # Validate data types
-    if not isinstance(device_config.get("port"), int):
-        raise ValueError(
-            f"Device '{device_name}' has invalid 'port' value. "
-            f"Expected integer, got {type(device_config.get('port')).__name__}"
-        )
-
     log.debug("Device '%s' configuration validated successfully", device_name)
 
 
