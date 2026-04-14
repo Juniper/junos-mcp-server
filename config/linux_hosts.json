@@ -1,61 +1,61 @@
 {
     "mgmtha0": {
-        "ip": "10.48.17.193",
+        "ip": "a.b.c.d",
         "port": 22,
-        "username": "root",
+        "username": "user",
         "auth": {
             "type": "password",
-            "password": "Embe1mpls"
+            "password": "password"
         },
         "metadata": {
-            "environment": "ccl-prod",
-            "role": "orion",
-            "owner": "vijayc",
+            "environment": "c-prod",
+            "role": "or",
+            "owner": "owner",
             "os": "ubuntu-22.04"
         }
     },
     "ondetra1a": {
-        "ip": "10.48.17.190",
+        "ip": "a.b.c.d",
         "port": 22,
-        "username": "root",
+        "username": "user",
         "auth": {
             "type": "password",
-            "password": "Embe1mpls"
+            "password": "password"
         },
         "metadata": {
-            "environment": "ccl-prod",
-            "role": "non-mgmtha",
-            "owner": "vijayc",
+            "environment": "c-prod",
+            "role": "non-mgt",
+            "owner": "user",
             "os": "ubuntu-22.04"
         }
     },
     "mgmtha1": {
-        "ip": "10.48.47.65",
+        "ip": "a.b.c.d",
         "port": 22,
-        "username": "ccl",
+        "username": "user",
         "auth": {
             "type": "password",
-            "password": "juniper123"
+            "password": "password"
         },
         "metadata": {
-            "environment": "ccl-prod",
-            "role": "pictor1",
-            "owner": "vijayc",
+            "environment": "c-prod",
+            "role": "pktr",
+            "owner": "user",
             "os": "ubuntu-22.04"
         }
     },
     "mgmtha2": {
-        "ip": "10.48.47.63",
+        "ip": "a.b.c.d",
         "port": 22,
-        "username": "ccl",
+        "username": "user",
         "auth": {
             "type": "password",
-            "password": "juniper123"
+            "password": "password"
         },
         "metadata": {
-            "environment": "ccl-prod",
-            "role": "pictor2",
-            "owner": "vijayc",
+            "environment": "c-prod",
+            "role": "pktr",
+            "owner": "user",
             "os": "ubuntu-22.04"
         }
     }
