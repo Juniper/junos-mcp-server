@@ -94,8 +94,17 @@ class ConnectionPool:
         self._connections: dict[str, dict] = {}
         self._pool_lock = threading.Lock()
         if idle_timeout is None:
+            self._idle_timeout = 300
             env_val = os.getenv("JMCP_POOL_IDLE_TIMEOUT")
-            self._idle_timeout = int(env_val) if env_val else 300
+            if env_val is not None:
+                try:
+                    self._idle_timeout = int(env_val)
+                except ValueError:
+                    log.warning(
+                        "Invalid JMCP_POOL_IDLE_TIMEOUT environment variable "
+                        "value: %s. Using default idle timeout.",
+                        env_val,
+                    )
         else:
             self._idle_timeout = idle_timeout
         self._running = True
