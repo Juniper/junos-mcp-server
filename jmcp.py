@@ -1160,7 +1160,9 @@ async def handle_execute_junos_command(
             router_name,
             timeout,
         )
-        result = _run_junos_cli_command(router_name, command, timeout)
+        result = await anyio.to_thread.run_sync(
+            _run_junos_cli_command, router_name, command, timeout
+        )
 
     end_time = time.time()
     end_timestamp = datetime.now(timezone.utc).isoformat()
@@ -1804,23 +1806,24 @@ async def handle_gather_device_facts(
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug("Getting facts from router %s with timeout %ss", router_name, timeout)
-        try:
+
+        def _gather_facts_sync() -> str:
             with connection_pool.get_connection(router_name, timeout) as junos_device:
                 junos_device.facts_refresh()
-                facts = junos_device.facts
-                # Convert _FactCache to a regular dict
-                facts_dict = dict(facts)
+                facts_dict = dict(junos_device.facts)
 
-                # Custom JSON encoder to handle version_info and other complex objects
                 def json_serializer(obj):
-                    if hasattr(obj, "_asdict"):  # Named tuples like version_info
+                    if hasattr(obj, "_asdict"):
                         return obj._asdict()
-                    elif hasattr(obj, "__dict__"):  # Objects with __dict__
+                    elif hasattr(obj, "__dict__"):
                         return obj.__dict__
                     else:
                         return str(obj)
 
-                result = json.dumps(facts_dict, indent=2, default=json_serializer)
+                return json.dumps(facts_dict, indent=2, default=json_serializer)
+
+        try:
+            result = await anyio.to_thread.run_sync(_gather_facts_sync)
         except ValueError as ve:
             result = f"Error: {ve}"
         except ConnectError as ce:
@@ -1957,8 +1960,8 @@ async def handle_execute_pfe_command(
             router_name,
             timeout,
         )
-        result = _run_junos_pfe_command(
-            router_name, target=target, command=command, timeout=timeout
+        result = await anyio.to_thread.run_sync(
+            _run_junos_pfe_command, router_name, target, command, timeout
         )
         if isinstance(result, dict):
             # Normal case: RPC succeeded, result is a dict keyed by target
@@ -2016,65 +2019,54 @@ async def handle_load_and_commit_config(
             router_name,
             config_format,
         )
-        try:
-            with connection_pool.get_connection(router_name, timeout) as junos_device:
-                # Initialize configuration utility
-                config_util = Config(junos_device)
 
-                # Lock the configuration
+        def _load_and_commit_sync() -> str:
+            with connection_pool.get_connection(router_name, timeout) as junos_device:
+                config_util = Config(junos_device)
                 try:
                     config_util.lock()
                 except Exception as e:
-                    result = f"Failed to lock configuration: {e}"
-                else:
+                    return f"Failed to lock configuration: {e}"
+
+                try:
+                    fmt = config_format.lower()
+                    if fmt in ("set", "text", "xml"):
+                        config_util.load(config_text, format=fmt)
+                    else:
+                        config_util.unlock()
+                        return (
+                            f"Error: Unsupported config format "
+                            f"'{config_format}'. Use 'set', 'text', or 'xml'"
+                        )
+
+                    diff = config_util.diff()
+                    if not diff:
+                        config_util.unlock()
+                        return "No configuration changes detected"
+
+                    config_util.commit(comment=commit_comment, timeout=timeout)
+                    config_util.unlock()
+                    return (
+                        "Configuration successfully loaded and "
+                        f"committed on {router_name}. Changes:\n{diff}"
+                    )
+                except Exception as e:
                     try:
-                        # Load the configuration based on format
-                        if config_format.lower() == "set":
-                            config_util.load(config_text, format="set")
-                        elif config_format.lower() == "text":
-                            config_util.load(config_text, format="text")
-                        elif config_format.lower() == "xml":
-                            config_util.load(config_text, format="xml")
-                        else:
-                            config_util.unlock()
-                            result = (
-                                f"Error: Unsupported config format "
-                                f"'{config_format}'. Use 'set', 'text', or 'xml'"
-                            )
+                        config_util.rollback()
+                        config_util.unlock()
+                    except (
+                        ConfigLoadError,
+                        CommitError,
+                        LockError,
+                        RuntimeError,
+                        OSError,
+                        AttributeError,
+                    ):
+                        pass
+                    return f"Failed to load/commit configuration: {e}"
 
-                        if "result" not in locals():
-                            # Check for differences
-                            diff = config_util.diff()
-                            if not diff:
-                                config_util.unlock()
-                                result = "No configuration changes detected"
-                            else:
-                                # Commit the configuration
-                                config_util.commit(
-                                    comment=commit_comment, timeout=timeout
-                                )
-                                config_util.unlock()
-                                result = (
-                                    "Configuration successfully loaded and "
-                                    f"committed on {router_name}. Changes:\n{diff}"
-                                )
-
-                    except Exception as e:
-                        # If anything fails, rollback and unlock
-                        try:
-                            config_util.rollback()
-                            config_util.unlock()
-                        except (
-                            ConfigLoadError,
-                            CommitError,
-                            LockError,
-                            RuntimeError,
-                            OSError,
-                            AttributeError,
-                        ):
-                            pass
-                        result = f"Failed to load/commit configuration: {e}"
-
+        try:
+            result = await anyio.to_thread.run_sync(_load_and_commit_sync)
         except ValueError as ve:
             result = f"Error: {ve}"
         except ConnectError as ce:
