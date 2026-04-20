@@ -26,7 +26,9 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,6 +80,171 @@ devices = {}
 
 # Junos MCP Server
 JUNOS_MCP = "jmcp-server"
+
+
+class ConnectionPool:
+    """Thread-safe SSH connection pool for Junos devices.
+
+    Reuses SSH sessions across tool calls instead of opening a new connection
+    for every command. Idle connections are closed after a configurable timeout
+    (default 300s, configurable via JMCP_POOL_IDLE_TIMEOUT env var).
+    """
+
+    def __init__(self, idle_timeout: int = None):
+        self._connections: dict[str, dict] = {}
+        self._pool_lock = threading.Lock()
+        if idle_timeout is None:
+            self._idle_timeout = 300
+            env_val = os.getenv("JMCP_POOL_IDLE_TIMEOUT")
+            if env_val is not None:
+                try:
+                    self._idle_timeout = int(env_val)
+                except ValueError:
+                    log.warning(
+                        "Invalid JMCP_POOL_IDLE_TIMEOUT environment variable "
+                        "value: %s. Using default idle timeout.",
+                        env_val,
+                    )
+        else:
+            self._idle_timeout = idle_timeout
+        self._running = True
+        self._cleanup_thread = threading.Thread(
+            target=self._cleanup_loop, daemon=True, name="pool-cleanup"
+        )
+        self._cleanup_thread.start()
+        log.info(
+            "Connection pool initialized (idle_timeout=%ds)", self._idle_timeout
+        )
+
+    @contextmanager
+    def get_connection(self, router_name: str, timeout: int = 360):
+        """Get a pooled device connection. Creates or reuses as needed.
+
+        Args:
+            router_name: Name of the router (must exist in devices dict)
+            timeout: Command timeout to set on the device
+
+        Yields:
+            An open jnpr.junos.Device instance
+
+        Raises:
+            ValueError: If connection params are invalid
+            ConnectError: If SSH connection fails
+        """
+        entry = self._get_or_create_entry(router_name)
+        entry["lock"].acquire()
+        try:
+            device = entry["device"]
+            if device is None or not device.connected:
+                if device is not None:
+                    try:
+                        device.close()
+                    except Exception:
+                        pass
+                    entry["device"] = None
+                device_info = devices[router_name]
+                connect_params = prepare_connection_params(device_info, router_name)
+                device = Device(**connect_params)
+                device.open()
+                entry["device"] = device
+                log.info("Pool: opened new connection to %s", router_name)
+            else:
+                log.debug("Pool: reusing connection to %s", router_name)
+
+            device.timeout = timeout
+            yield device
+            entry["last_used"] = time.time()
+        except Exception:
+            # Invalidate connection if it's no longer alive
+            if entry["device"] is not None and not entry["device"].connected:
+                try:
+                    entry["device"].close()
+                except Exception:
+                    pass
+                entry["device"] = None
+            raise
+        finally:
+            entry["lock"].release()
+
+    def _get_or_create_entry(self, router_name: str) -> dict:
+        with self._pool_lock:
+            if router_name not in self._connections:
+                self._connections[router_name] = {
+                    "device": None,
+                    "lock": threading.Lock(),
+                    "last_used": 0.0,
+                }
+            return self._connections[router_name]
+
+    def _cleanup_loop(self):
+        while self._running:
+            time.sleep(60)
+            self._cleanup_idle()
+
+    def _cleanup_idle(self):
+        now = time.time()
+        with self._pool_lock:
+            for router_name in list(self._connections):
+                entry = self._connections[router_name]
+                if entry["lock"].locked():
+                    continue
+                if (
+                    entry["device"] is not None
+                    and entry["last_used"] > 0
+                    and (now - entry["last_used"]) > self._idle_timeout
+                ):
+                    if entry["lock"].acquire(blocking=False):
+                        try:
+                            try:
+                                entry["device"].close()
+                            except Exception as e:
+                                log.debug(
+                                    "Pool: error closing idle connection to %s: %s",
+                                    router_name,
+                                    e,
+                                )
+                            entry["device"] = None
+                            log.info(
+                                "Pool: closed idle connection to %s (idle %.0fs)",
+                                router_name,
+                                now - entry["last_used"],
+                            )
+                        finally:
+                            entry["lock"].release()
+
+    def close_all(self):
+        """Close all pooled connections."""
+        self._running = False
+        with self._pool_lock:
+            for router_name, entry in self._connections.items():
+                if entry["device"] is not None:
+                    try:
+                        entry["device"].close()
+                    except Exception as e:
+                        log.debug(
+                            "Pool: error closing connection to %s: %s",
+                            router_name,
+                            e,
+                        )
+                    entry["device"] = None
+            self._connections.clear()
+        log.info("Connection pool: all connections closed")
+
+    @property
+    def stats(self) -> dict:
+        """Return pool statistics."""
+        with self._pool_lock:
+            total = len(self._connections)
+            active = sum(
+                1
+                for e in self._connections.values()
+                if e["device"] is not None and e["device"].connected
+            )
+            return {"total_entries": total, "active_connections": active}
+
+
+# Global connection pool instance
+connection_pool = ConnectionPool()
 
 
 class Context(BaseModel, Generic[ServerSessionT, LifespanContextT, RequestT]):
@@ -648,23 +815,19 @@ The device is now available for use with all Junos MCP tools."""
 
 
 def _run_junos_cli_command(router_name: str, command: str, timeout: int = 360) -> str:
-    """Internal helper to connect and run a Junos CLI command."""
+    """Internal helper to run a Junos CLI command using the connection pool."""
     log.debug(
         "Executing command %s on router %s with timeout %ss (internal)",
         command,
         router_name,
         timeout,
     )
-    device_info = devices[router_name]
     try:
-        connect_params = prepare_connection_params(device_info, router_name)
-    except ValueError as ve:
-        return f"Error: {ve}"
-    try:
-        with Device(**connect_params) as junos_device:
-            junos_device.timeout = timeout
+        with connection_pool.get_connection(router_name, timeout) as junos_device:
             op = junos_device.cli(command, warning=False)
             return op
+    except ValueError as ve:
+        return f"Error: {ve}"
     except ConnectError as ce:
         return f"Connection error to {router_name}: {ce}"
     except Exception as e:
@@ -686,17 +849,13 @@ def _run_junos_pfe_command(
         router_name,
         timeout,
     )
-    device_info = devices[router_name]
     try:
-        connect_params = prepare_connection_params(device_info, router_name)
-    except ValueError as ve:
-        return f"Error: {ve}"
-    try:
-        with Device(**connect_params) as junos_device:
-            junos_device.timeout = timeout
+        with connection_pool.get_connection(router_name, timeout) as junos_device:
             op = junos_device.rpc.request_pfe_execute(target=target, command=command)
             result_text = op.text if hasattr(op, "text") else str(op)
             return {target: result_text}
+    except ValueError as ve:
+        return f"Error: {ve}"
     except ConnectError as ce:
         return f"Connection error to {router_name}: {ce}"
     except Exception as e:
@@ -1001,7 +1160,9 @@ async def handle_execute_junos_command(
             router_name,
             timeout,
         )
-        result = _run_junos_cli_command(router_name, command, timeout)
+        result = await anyio.to_thread.run_sync(
+            _run_junos_cli_command, router_name, command, timeout
+        )
 
     end_time = time.time()
     end_timestamp = datetime.now(timezone.utc).isoformat()
@@ -1470,161 +1631,133 @@ router_name or router_names.
                 f"{'Checking' if dry_run else 'Applying'} configuration on {rtr_name}..."
             )
 
-            device_info = devices[rtr_name]
-
-            # Use prepare_connection_params to get proper connection parameters
-            try:
-                connect_params = prepare_connection_params(device_info, rtr_name)
-            except ValueError as ve:
-                application_results.append(f"❌ {rtr_name}: {ve}")
-                await context.error(f"{rtr_name}: {ve}")
-                continue
-
-            # Connect to device
-            dev = Device(**connect_params)
-
-            try:
-                dev.open()
+            with connection_pool.get_connection(rtr_name) as dev:
                 await context.info(f"Connected to {rtr_name}")
 
                 # Load configuration using exclusive mode
-                try:
-                    with Config(dev, mode="exclusive") as cu:
-                        await context.info(f"Loading configuration on {rtr_name}...")
-                        cu.load(rendered_config, format="set")
+                with Config(dev, mode="exclusive") as cu:
+                    await context.info(f"Loading configuration on {rtr_name}...")
+                    cu.load(rendered_config, format="set")
 
-                        # Get diff
-                        diff = cu.diff()
+                    # Get diff
+                    diff = cu.diff()
 
-                        if not diff:
-                            result_msg = "No configuration changes detected"
-                            application_results.append(f"ℹ️  {rtr_name}: {result_msg}")
-                            await context.info(f"{rtr_name}: {result_msg}")
-                        else:
-                            if dry_run:
-                                # DRY RUN: Perform commit check, show diff,
-                                # and rollback without committing
-                                await context.info(
-                                    f"Performing commit check on {rtr_name}..."
-                                )
+                    if not diff:
+                        result_msg = "No configuration changes detected"
+                        application_results.append(f"ℹ️  {rtr_name}: {result_msg}")
+                        await context.info(f"{rtr_name}: {result_msg}")
+                    else:
+                        if dry_run:
+                            # DRY RUN: Perform commit check, show diff,
+                            # and rollback without committing
+                            await context.info(
+                                f"Performing commit check on {rtr_name}..."
+                            )
 
-                                try:
-                                    check_result = cu.commit_check()
-
-                                    if not check_result:
-                                        result_msg = (
-                                            "Commit check failed - "
-                                            "configuration has errors"
-                                        )
-                                        application_results.append(
-                                            f"❌ {rtr_name}: {result_msg}"
-                                        )
-                                        await context.error(f"{rtr_name}: {result_msg}")
-                                    else:
-                                        result_msg = (
-                                            "Configuration check successful. "
-                                            f"Changes:\n\n{diff}"
-                                        )
-                                        application_results.append(
-                                            f"🔍 {rtr_name}: {result_msg}"
-                                        )
-                                        await context.info(
-                                            f"{rtr_name}: Dry-run commit check passed"
-                                        )
-
-                                except Exception as check_error:
-                                    result_msg = f"Commit check error: {check_error}"
-                                    application_results.append(
-                                        f"❌ {rtr_name}: {result_msg}"
-                                    )
-                                    await context.error(f"{rtr_name}: {result_msg}")
-                                finally:
-                                    # CRITICAL: Always rollback in dry-run mode
-                                    await context.info(
-                                        f"{rtr_name}: Rolling back changes (dry-run mode)"
-                                    )
-                                    try:
-                                        # Perform the rollback
-                                        cu.rollback()
-                                        # Verify rollback success by checking
-                                        # if there are pending changes.
-                                        # After a successful rollback, there
-                                        # should be no differences.
-                                        diff = cu.diff()
-
-                                        if diff:
-                                            await context.error(
-                                                f"{rtr_name}: Rollback verification "
-                                                "failed - unexpected changes remain"
-                                            )
-                                            await context.error(
-                                                f"{rtr_name}: Remaining diff:\n{diff}"
-                                            )
-                                        else:
-                                            await context.info(
-                                                f"{rtr_name}: Rollback verified "
-                                                "successfully - no pending changes"
-                                            )
-
-                                    except Exception as rollback_error:
-                                        await context.error(
-                                            f"{rtr_name}: Rollback failed with "
-                                            f"error: {str(rollback_error)}"
-                                        )
-                            else:
-                                # REAL COMMIT: Perform commit check before committing
-                                await context.info(
-                                    f"Performing commit check on {rtr_name}..."
-                                )
+                            try:
                                 check_result = cu.commit_check()
 
                                 if not check_result:
                                     result_msg = (
-                                        "Commit check failed - configuration has errors"
+                                        "Commit check failed - "
+                                        "configuration has errors"
                                     )
                                     application_results.append(
                                         f"❌ {rtr_name}: {result_msg}"
                                     )
                                     await context.error(f"{rtr_name}: {result_msg}")
-                                    cu.rollback()
                                 else:
-                                    # Apply the changes
-                                    await context.info(
-                                        f"Committing configuration on {rtr_name}..."
-                                    )
-                                    cu.commit(comment=commit_comment)
                                     result_msg = (
-                                        "Configuration committed successfully. "
+                                        "Configuration check successful. "
                                         f"Changes:\n\n{diff}"
                                     )
                                     application_results.append(
-                                        f"✅ {rtr_name}: {result_msg}"
+                                        f"🔍 {rtr_name}: {result_msg}"
                                     )
                                     await context.info(
-                                        f"{rtr_name}: Configuration committed successfully"
+                                        f"{rtr_name}: Dry-run commit check passed"
                                     )
 
-                except (ConfigLoadError, CommitError, LockError) as e:
-                    error_msg = f"Configuration error: {e}"
-                    application_results.append(f"❌ {rtr_name}: {error_msg}")
-                    await context.error(f"{rtr_name}: {error_msg}")
+                            except Exception as check_error:
+                                result_msg = f"Commit check error: {check_error}"
+                                application_results.append(
+                                    f"❌ {rtr_name}: {result_msg}"
+                                )
+                                await context.error(f"{rtr_name}: {result_msg}")
+                            finally:
+                                # CRITICAL: Always rollback in dry-run mode
+                                await context.info(
+                                    f"{rtr_name}: Rolling back changes (dry-run mode)"
+                                )
+                                try:
+                                    # Perform the rollback
+                                    cu.rollback()
+                                    # Verify rollback success by checking
+                                    # if there are pending changes.
+                                    # After a successful rollback, there
+                                    # should be no differences.
+                                    diff = cu.diff()
 
-            except ConnectError as e:
-                error_msg = f"Connection failed: {e}"
-                application_results.append(f"❌ {rtr_name}: {error_msg}")
-                await context.error(f"{rtr_name}: {error_msg}")
-            finally:
-                # Always close the device connection
-                try:
-                    dev.close()
-                    await context.info(f"Disconnected from {rtr_name}")
-                except Exception as close_error:
-                    log.warning(
-                        "Error while closing test connection to %s: %s",
-                        rtr_name,
-                        close_error,
-                    )
+                                    if diff:
+                                        await context.error(
+                                            f"{rtr_name}: Rollback verification "
+                                            "failed - unexpected changes remain"
+                                        )
+                                        await context.error(
+                                            f"{rtr_name}: Remaining diff:\n{diff}"
+                                        )
+                                    else:
+                                        await context.info(
+                                            f"{rtr_name}: Rollback verified "
+                                            "successfully - no pending changes"
+                                        )
 
+                                except Exception as rollback_error:
+                                    await context.error(
+                                        f"{rtr_name}: Rollback failed with "
+                                        f"error: {str(rollback_error)}"
+                                    )
+                        else:
+                            # REAL COMMIT: Perform commit check before committing
+                            await context.info(
+                                f"Performing commit check on {rtr_name}..."
+                            )
+                            check_result = cu.commit_check()
+
+                            if not check_result:
+                                result_msg = (
+                                    "Commit check failed - configuration has errors"
+                                )
+                                application_results.append(
+                                    f"❌ {rtr_name}: {result_msg}"
+                                )
+                                await context.error(f"{rtr_name}: {result_msg}")
+                                cu.rollback()
+                            else:
+                                # Apply the changes
+                                await context.info(
+                                    f"Committing configuration on {rtr_name}..."
+                                )
+                                cu.commit(comment=commit_comment)
+                                result_msg = (
+                                    "Configuration committed successfully. "
+                                    f"Changes:\n\n{diff}"
+                                )
+                                application_results.append(
+                                    f"✅ {rtr_name}: {result_msg}"
+                                )
+                                await context.info(
+                                    f"{rtr_name}: Configuration committed successfully"
+                                )
+
+        except (ValueError, ConnectError) as e:
+            error_msg = f"Connection failed: {e}"
+            application_results.append(f"❌ {rtr_name}: {error_msg}")
+            await context.error(f"{rtr_name}: {error_msg}")
+        except (ConfigLoadError, CommitError, LockError) as e:
+            error_msg = f"Configuration error: {e}"
+            application_results.append(f"❌ {rtr_name}: {error_msg}")
+            await context.error(f"{rtr_name}: {error_msg}")
         except Exception as e:
             error_msg = f"Failed to apply configuration: {e}"
             application_results.append(f"❌ {rtr_name}: {error_msg}")
@@ -1673,33 +1806,30 @@ async def handle_gather_device_facts(
         result = f"Router {router_name} not found in the device mapping."
     else:
         log.debug("Getting facts from router %s with timeout %ss", router_name, timeout)
-        device_info = devices[router_name]
+
+        def _gather_facts_sync() -> str:
+            with connection_pool.get_connection(router_name, timeout) as junos_device:
+                junos_device.facts_refresh()
+                facts_dict = dict(junos_device.facts)
+
+                def json_serializer(obj):
+                    if hasattr(obj, "_asdict"):
+                        return obj._asdict()
+                    elif hasattr(obj, "__dict__"):
+                        return obj.__dict__
+                    else:
+                        return str(obj)
+
+                return json.dumps(facts_dict, indent=2, default=json_serializer)
+
         try:
-            connect_params = prepare_connection_params(device_info, router_name)
-            connect_params["timeout"] = timeout
+            result = await anyio.to_thread.run_sync(_gather_facts_sync)
         except ValueError as ve:
             result = f"Error: {ve}"
-        else:
-            try:
-                with Device(**connect_params) as junos_device:
-                    facts = junos_device.facts
-                    # Convert _FactCache to a regular dict
-                    facts_dict = dict(facts)
-
-                    # Custom JSON encoder to handle version_info and other complex objects
-                    def json_serializer(obj):
-                        if hasattr(obj, "_asdict"):  # Named tuples like version_info
-                            return obj._asdict()
-                        elif hasattr(obj, "__dict__"):  # Objects with __dict__
-                            return obj.__dict__
-                        else:
-                            return str(obj)
-
-                    result = json.dumps(facts_dict, indent=2, default=json_serializer)
-            except ConnectError as ce:
-                result = f"Connection error to {router_name}: {ce}"
-            except Exception as e:
-                result = f"An error occurred: {e}"
+        except ConnectError as ce:
+            result = f"Connection error to {router_name}: {ce}"
+        except Exception as e:
+            result = f"An error occurred: {e}"
 
     content_block = types.TextContent(
         type="text", text=result, annotations={"router_name": router_name}
@@ -1741,6 +1871,9 @@ async def handle_reload_devices(
                 type="text", text=f"Error: Device configuration validation failed: {e}"
             )
         ]
+
+    # Close all pooled connections since device configs may have changed
+    connection_pool.close_all()
 
     old_count = len(devices)
     devices = new_devices
@@ -1827,8 +1960,8 @@ async def handle_execute_pfe_command(
             router_name,
             timeout,
         )
-        result = _run_junos_pfe_command(
-            router_name, target=target, command=command, timeout=timeout
+        result = await anyio.to_thread.run_sync(
+            _run_junos_pfe_command, router_name, target, command, timeout
         )
         if isinstance(result, dict):
             # Normal case: RPC succeeded, result is a dict keyed by target
@@ -1886,76 +2019,60 @@ async def handle_load_and_commit_config(
             router_name,
             config_format,
         )
-        device_info = devices[router_name]
+
+        def _load_and_commit_sync() -> str:
+            with connection_pool.get_connection(router_name, timeout) as junos_device:
+                config_util = Config(junos_device)
+                try:
+                    config_util.lock()
+                except Exception as e:
+                    return f"Failed to lock configuration: {e}"
+
+                try:
+                    fmt = config_format.lower()
+                    if fmt in ("set", "text", "xml"):
+                        config_util.load(config_text, format=fmt)
+                    else:
+                        config_util.unlock()
+                        return (
+                            f"Error: Unsupported config format "
+                            f"'{config_format}'. Use 'set', 'text', or 'xml'"
+                        )
+
+                    diff = config_util.diff()
+                    if not diff:
+                        config_util.unlock()
+                        return "No configuration changes detected"
+
+                    config_util.commit(comment=commit_comment, timeout=timeout)
+                    config_util.unlock()
+                    return (
+                        "Configuration successfully loaded and "
+                        f"committed on {router_name}. Changes:\n{diff}"
+                    )
+                except Exception as e:
+                    try:
+                        config_util.rollback()
+                        config_util.unlock()
+                    except (
+                        ConfigLoadError,
+                        CommitError,
+                        LockError,
+                        RuntimeError,
+                        OSError,
+                        AttributeError,
+                    ):
+                        pass
+                    return f"Failed to load/commit configuration: {e}"
 
         try:
-            connect_params = prepare_connection_params(device_info, router_name)
+            result = await anyio.to_thread.run_sync(_load_and_commit_sync)
         except ValueError as ve:
             result = f"Error: {ve}"
-        else:
-            try:
-                with Device(**connect_params) as junos_device:
-                    # Initialize configuration utility
-                    config_util = Config(junos_device)
-
-                    # Lock the configuration
-                    try:
-                        config_util.lock()
-                    except Exception as e:
-                        result = f"Failed to lock configuration: {e}"
-                    else:
-                        try:
-                            # Load the configuration based on format
-                            if config_format.lower() == "set":
-                                config_util.load(config_text, format="set")
-                            elif config_format.lower() == "text":
-                                config_util.load(config_text, format="text")
-                            elif config_format.lower() == "xml":
-                                config_util.load(config_text, format="xml")
-                            else:
-                                config_util.unlock()
-                                result = (
-                                    f"Error: Unsupported config format "
-                                    f"'{config_format}'. Use 'set', 'text', or 'xml'"
-                                )
-
-                            if "result" not in locals():
-                                # Check for differences
-                                diff = config_util.diff()
-                                if not diff:
-                                    config_util.unlock()
-                                    result = "No configuration changes detected"
-                                else:
-                                    # Commit the configuration
-                                    config_util.commit(
-                                        comment=commit_comment, timeout=timeout
-                                    )
-                                    config_util.unlock()
-                                    result = (
-                                        "Configuration successfully loaded and "
-                                        f"committed on {router_name}. Changes:\n{diff}"
-                                    )
-
-                        except Exception as e:
-                            # If anything fails, rollback and unlock
-                            try:
-                                config_util.rollback()
-                                config_util.unlock()
-                            except (
-                                ConfigLoadError,
-                                CommitError,
-                                LockError,
-                                RuntimeError,
-                                OSError,
-                                AttributeError,
-                            ):
-                                pass
-                            result = f"Failed to load/commit configuration: {e}"
-
-            except ConnectError as ce:
-                result = f"Connection error to {router_name}: {ce}"
-            except Exception as e:
-                result = f"An error occurred: {e}"
+        except ConnectError as ce:
+            result = f"Connection error to {router_name}: {ce}"
+        except Exception as e:
+            result = f"An error occurred: {e}"
 
     content_block = types.TextContent(
         type="text",
@@ -2400,6 +2517,7 @@ def main():
     # Set up signal handler for clean shutdown
     def signal_handler(sig, frame):
         print("\nShutting down MCP server...")
+        connection_pool.close_all()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
