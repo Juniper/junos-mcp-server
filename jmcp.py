@@ -1487,11 +1487,27 @@ router_name or router_names.
                 dev.open()
                 await context.info(f"Connected to {rtr_name}")
 
+                # Detect config format: "set" if all non-empty lines
+                # start with set/delete/deactivate/activate, otherwise "text"
+                config_format = "set"
+                for line in rendered_config.strip().splitlines():
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if not re.match(
+                        r"^(set|delete|deactivate|activate)\s", stripped
+                    ):
+                        config_format = "text"
+                        break
+
                 # Load configuration using exclusive mode
                 try:
                     with Config(dev, mode="exclusive") as cu:
-                        await context.info(f"Loading configuration on {rtr_name}...")
-                        cu.load(rendered_config, format="set")
+                        await context.info(
+                            f"Loading configuration on {rtr_name} "
+                            f"(format={config_format})..."
+                        )
+                        cu.load(rendered_config, format=config_format)
 
                         # Get diff
                         diff = cu.diff()
