@@ -2181,43 +2181,78 @@ def create_mcp_server() -> Server:
             ),
             types.Tool(
                 name="render_and_apply_j2_template",
-                description="Render a Jinja2 template and apply it to the router",
+                description=(
+                    "Render a Jinja2 template with YAML variables and optionally apply it "
+                    "to one or more Junos routers. "
+                    "When apply_config=false (default), the template is only rendered locally "
+                    "— no device connection is made. "
+                    "When apply_config=true, the tool connects to the device(s) and loads the "
+                    "rendered configuration. "
+                    "Combine apply_config=true with dry_run=true to perform a commit check "
+                    "on the device and display the diff without committing — changes are "
+                    "automatically rolled back after the check. "
+                    "Use router_name for a single device or router_names (list) for multiple "
+                    "devices; at least one must be provided when apply_config=true."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "router_name": {
                             "type": "string",
-                            "description": "The name of the router",
+                            "description": (
+                                "Name of a single router to apply the configuration to. "
+                                "Required when apply_config=true and router_names is not provided."
+                            ),
+                        },
+                        "router_names": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "JSON array of router name strings to apply the configuration to "
+                                "in sequence, e.g. ['pe1', 'pe2', 'pe3']. "
+                                "Each element must exactly match a name in the device mapping. "
+                                "Use this instead of router_name when targeting multiple devices. "
+                                "Required when apply_config=true and router_name is not provided."
+                            ),
                         },
                         "template_content": {
                             "type": "string",
-                            "description": "Jinja2 template to load",
+                            "description": "Jinja2 template content as a string.",
                         },
                         "vars_content": {
                             "type": "string",
-                            "description": "YAML variables to load",
+                            "description": "YAML-formatted variables to render into the template.",
                         },
                         "apply_config": {
                             "type": "boolean",
-                            "description": "Boolean to apply or just render (default: False)",
+                            "description": (
+                                "If false (default), only render the template locally without "
+                                "connecting to any device. If true, connect to the device(s) "
+                                "and load the rendered configuration."
+                            ),
                         },
                         "dry_run": {
                             "type": "boolean",
                             "description": (
-                                "Boolean to show diff without committing "
-                                "(default: False)"
+                                "Only effective when apply_config=true. If true, perform a "
+                                "commit check on the device and show the diff without committing. "
+                                "Changes are automatically rolled back after the check. "
+                                "If false (default), commit the configuration."
                             ),
                         },
                         "commit_comment": {
                             "type": "string",
-                            "description": "Commit comment",
-                            "default": "Configuration loaded via MCP",
+                            "description": "Commit comment recorded in the device commit log.",
+                            "default": "Configuration applied via Jinja2 template",
                         },
                         "config_format": {
                             "type": "string",
                             "description": (
-                                "Configuration format: 'set', 'text' (stanza), or 'xml'. "
-                                "If omitted, auto-detected from the rendered template content."
+                                "Configuration format: 'set' (flat set commands), "
+                                "'text' (stanza/hierarchical), or 'xml'. "
+                                "If omitted, auto-detected from the rendered template content: "
+                                "lines starting with set/delete/deactivate/activate → 'set', "
+                                "otherwise → 'text'."
                             ),
                             "enum": ["set", "text", "xml"],
                         },
@@ -2506,3 +2541,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
