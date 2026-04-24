@@ -1433,9 +1433,7 @@ async def handle_render_and_apply_j2_template(
         result_text = (
             "✅ Template rendered successfully!\n\n"
             "**Rendered Configuration:**\n"
-            "```\n"
-            + rendered_config
-            + "\n```\n\n"
+            "```\n" + rendered_config + "\n```\n\n"
             "To apply this configuration to devices, set apply_config=true and provide "
             "router_name or router_names.\n"
         )
@@ -1493,9 +1491,7 @@ async def handle_render_and_apply_j2_template(
 
                 if config_format_override:
                     config_format = config_format_override
-                    await context.info(
-                        f"Using explicit config format: {config_format}"
-                    )
+                    await context.info(f"Using explicit config format: {config_format}")
                 else:
                     config_format = "set"
                     for line in rendered_config.strip().splitlines():
@@ -1507,9 +1503,7 @@ async def handle_render_and_apply_j2_template(
                         ):
                             config_format = "text"
                             break
-                    await context.info(
-                        f"Auto-detected config format: {config_format}"
-                    )
+                    await context.info(f"Auto-detected config format: {config_format}")
 
                 try:
                     with Config(dev, mode="exclusive") as cu:
@@ -1653,12 +1647,8 @@ async def handle_render_and_apply_j2_template(
         mode_prefix + "Configuration " + mode_name + " complete!\n\n"
         "**Routers:** " + ", ".join(router_names) + "\n\n"
         "**Rendered Configuration:**\n"
-        "```\n"
-        + rendered_config
-        + "\n```\n\n"
-        "**Results:**\n"
-        + summary
-        + "\n"
+        "```\n" + rendered_config + "\n```\n\n"
+        "**Results:**\n" + summary + "\n"
     )
 
     return [
@@ -1673,6 +1663,7 @@ async def handle_render_and_apply_j2_template(
             },
         )
     ]
+
 
 async def handle_gather_device_facts(
     arguments: dict, context: Context
@@ -2541,4 +2532,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
