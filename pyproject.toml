@@ -20,6 +20,9 @@ dependencies = [
 [project.scripts]
 junos-mcp-server = "jmcp:main"
 
+[tool.black]
+target-version = ["py310"]
+
 [tool.setuptools]
 py-modules = ["jmcp", "jmcp_token_manager"]
 

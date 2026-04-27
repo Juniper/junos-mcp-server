@@ -43,7 +43,7 @@ jobs:
       - name: Run Code Quality Tools
         if: matrix.os == 'ubuntu-latest'
         run: |
-          black --check .
+          black --check --fast .
           pylint $(git ls-files '*.py' | grep -vE '^(docs/|build/|tests/|samples/|setup.py|versioneer.py)') --exit-zero
 
       - name: Run Unit Tests

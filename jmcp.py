@@ -1343,6 +1343,7 @@ async def handle_render_and_apply_j2_template(
             - apply_config: Boolean to apply or just render (default: False)
             - commit_comment: Optional commit comment
             - dry_run: Boolean to show diff without committing (default: False)
+            - config_format: Override format detection ('set', 'text', 'xml'). Auto-detected if omitted.
         context: MCP Context object
 
     Returns:
@@ -1357,10 +1358,10 @@ async def handle_render_and_apply_j2_template(
         "commit_comment", "Configuration applied via Jinja2 template"
     )
     dry_run = arguments.get("dry_run", False)
+    config_format_override = arguments.get("config_format", None)
 
     results = []
 
-    # Step 1: Validate inputs
     if not template_content:
         return [
             types.TextContent(
@@ -1373,11 +1374,20 @@ async def handle_render_and_apply_j2_template(
             types.TextContent(type="text", text="❌ Error: vars_content is required")
         ]
 
-    # Handle single router_name or list of router_names
+    if config_format_override and config_format_override not in ("set", "text", "xml"):
+        return [
+            types.TextContent(
+                type="text",
+                text=(
+                    f"❌ Error: invalid config_format '{config_format_override}'. "
+                    "Must be 'set', 'text', or 'xml'."
+                ),
+            )
+        ]
+
     if router_name and not router_names:
         router_names = [router_name]
 
-    # Step 2: Load variables from YAML string
     try:
         await context.info("Parsing variables from YAML content...")
         variables = yaml.safe_load(vars_content)
@@ -1398,7 +1408,6 @@ async def handle_render_and_apply_j2_template(
     except Exception as e:
         return [types.TextContent(type="text", text=f"❌ Error loading variables: {e}")]
 
-    # Step 3: Setup Jinja2 environment and render template
     try:
         await context.info("Rendering Jinja2 template...")
 
@@ -1420,18 +1429,14 @@ async def handle_render_and_apply_j2_template(
             )
         ]
 
-    # Step 4: If not applying, just return the rendered config
     if not apply_config:
-        result_text = f"""✅ Template rendered successfully!
-
-**Rendered Configuration:**
-```
-{rendered_config}
-```
-
-To apply this configuration to devices, set apply_config=true and provide
-router_name or router_names.
-"""
+        result_text = (
+            "✅ Template rendered successfully!\n\n"
+            "**Rendered Configuration:**\n"
+            "```\n" + rendered_config + "\n```\n\n"
+            "To apply this configuration to devices, set apply_config=true and provide "
+            "router_name or router_names.\n"
+        )
         return [
             types.TextContent(
                 type="text",
@@ -1443,7 +1448,6 @@ router_name or router_names.
             )
         ]
 
-    # Step 5: Apply configuration to specified routers
     if not router_names:
         return [
             types.TextContent(
@@ -1472,7 +1476,6 @@ router_name or router_names.
 
             device_info = devices[rtr_name]
 
-            # Use prepare_connection_params to get proper connection parameters
             try:
                 connect_params = prepare_connection_params(device_info, rtr_name)
             except ValueError as ve:
@@ -1480,20 +1483,36 @@ router_name or router_names.
                 await context.error(f"{rtr_name}: {ve}")
                 continue
 
-            # Connect to device
             dev = Device(**connect_params)
 
             try:
                 dev.open()
                 await context.info(f"Connected to {rtr_name}")
 
-                # Load configuration using exclusive mode
+                if config_format_override:
+                    config_format = config_format_override
+                    await context.info(f"Using explicit config format: {config_format}")
+                else:
+                    config_format = "set"
+                    for line in rendered_config.strip().splitlines():
+                        stripped = line.strip()
+                        if not stripped or stripped.startswith("#"):
+                            continue
+                        if not re.match(
+                            r"^(set|delete|deactivate|activate)\s", stripped
+                        ):
+                            config_format = "text"
+                            break
+                    await context.info(f"Auto-detected config format: {config_format}")
+
                 try:
                     with Config(dev, mode="exclusive") as cu:
-                        await context.info(f"Loading configuration on {rtr_name}...")
-                        cu.load(rendered_config, format="set")
+                        await context.info(
+                            f"Loading configuration on {rtr_name} "
+                            f"(format={config_format})..."
+                        )
+                        cu.load(rendered_config, format=config_format)
 
-                        # Get diff
                         diff = cu.diff()
 
                         if not diff:
@@ -1502,8 +1521,6 @@ router_name or router_names.
                             await context.info(f"{rtr_name}: {result_msg}")
                         else:
                             if dry_run:
-                                # DRY RUN: Perform commit check, show diff,
-                                # and rollback without committing
                                 await context.info(
                                     f"Performing commit check on {rtr_name}..."
                                 )
@@ -1539,17 +1556,11 @@ router_name or router_names.
                                     )
                                     await context.error(f"{rtr_name}: {result_msg}")
                                 finally:
-                                    # CRITICAL: Always rollback in dry-run mode
                                     await context.info(
                                         f"{rtr_name}: Rolling back changes (dry-run mode)"
                                     )
                                     try:
-                                        # Perform the rollback
                                         cu.rollback()
-                                        # Verify rollback success by checking
-                                        # if there are pending changes.
-                                        # After a successful rollback, there
-                                        # should be no differences.
                                         diff = cu.diff()
 
                                         if diff:
@@ -1572,7 +1583,6 @@ router_name or router_names.
                                             f"error: {str(rollback_error)}"
                                         )
                             else:
-                                # REAL COMMIT: Perform commit check before committing
                                 await context.info(
                                     f"Performing commit check on {rtr_name}..."
                                 )
@@ -1588,7 +1598,6 @@ router_name or router_names.
                                     await context.error(f"{rtr_name}: {result_msg}")
                                     cu.rollback()
                                 else:
-                                    # Apply the changes
                                     await context.info(
                                         f"Committing configuration on {rtr_name}..."
                                     )
@@ -1614,7 +1623,6 @@ router_name or router_names.
                 application_results.append(f"❌ {rtr_name}: {error_msg}")
                 await context.error(f"{rtr_name}: {error_msg}")
             finally:
-                # Always close the device connection
                 try:
                     dev.close()
                     await context.info(f"Disconnected from {rtr_name}")
@@ -1630,23 +1638,18 @@ router_name or router_names.
             application_results.append(f"❌ {rtr_name}: {error_msg}")
             await context.error(f"{rtr_name}: {error_msg}")
 
-    # Step 6: Format final results
     summary = "\n".join(application_results)
 
     mode_prefix = "🔍 DRY RUN - " if dry_run else ""
     mode_name = "preview" if dry_run else "application"
-    final_text = f"""{mode_prefix}Configuration {mode_name} complete!
 
-**Routers:** {', '.join(router_names)}
-
-**Rendered Configuration:**
-```
-{rendered_config}
-```
-
-**Results:**
-{summary}
-"""
+    final_text = (
+        mode_prefix + "Configuration " + mode_name + " complete!\n\n"
+        "**Routers:** " + ", ".join(router_names) + "\n\n"
+        "**Rendered Configuration:**\n"
+        "```\n" + rendered_config + "\n```\n\n"
+        "**Results:**\n" + summary + "\n"
+    )
 
     return [
         types.TextContent(
@@ -2169,37 +2172,80 @@ def create_mcp_server() -> Server:
             ),
             types.Tool(
                 name="render_and_apply_j2_template",
-                description="Render a Jinja2 template and apply it to the router",
+                description=(
+                    "Render a Jinja2 template with YAML variables and optionally apply it "
+                    "to one or more Junos routers. "
+                    "When apply_config=false (default), the template is only rendered locally "
+                    "— no device connection is made. "
+                    "When apply_config=true, the tool connects to the device(s) and loads the "
+                    "rendered configuration. "
+                    "Combine apply_config=true with dry_run=true to perform a commit check "
+                    "on the device and display the diff without committing — changes are "
+                    "automatically rolled back after the check. "
+                    "Use router_name for a single device or router_names (list) for multiple "
+                    "devices; at least one must be provided when apply_config=true."
+                ),
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "router_name": {
                             "type": "string",
-                            "description": "The name of the router",
+                            "description": (
+                                "Name of a single router to apply the configuration to. "
+                                "Required when apply_config=true and router_names is not provided."
+                            ),
+                        },
+                        "router_names": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "JSON array of router name strings to apply the configuration to "
+                                "in sequence, e.g. ['pe1', 'pe2', 'pe3']. "
+                                "Each element must exactly match a name in the device mapping. "
+                                "Use this instead of router_name when targeting multiple devices. "
+                                "Required when apply_config=true and router_name is not provided."
+                            ),
                         },
                         "template_content": {
                             "type": "string",
-                            "description": "Jinja2 template to load",
+                            "description": "Jinja2 template content as a string.",
                         },
                         "vars_content": {
                             "type": "string",
-                            "description": "YAML variables to load",
+                            "description": "YAML-formatted variables to render into the template.",
                         },
                         "apply_config": {
                             "type": "boolean",
-                            "description": "Boolean to apply or just render (default: False)",
+                            "description": (
+                                "If false (default), only render the template locally without "
+                                "connecting to any device. If true, connect to the device(s) "
+                                "and load the rendered configuration."
+                            ),
                         },
                         "dry_run": {
                             "type": "boolean",
                             "description": (
-                                "Boolean to show diff without committing "
-                                "(default: False)"
+                                "Only effective when apply_config=true. If true, perform a "
+                                "commit check on the device and show the diff without committing. "
+                                "Changes are automatically rolled back after the check. "
+                                "If false (default), commit the configuration."
                             ),
                         },
                         "commit_comment": {
                             "type": "string",
-                            "description": "Commit comment",
-                            "default": "Configuration loaded via MCP",
+                            "description": "Commit comment recorded in the device commit log.",
+                            "default": "Configuration applied via Jinja2 template",
+                        },
+                        "config_format": {
+                            "type": "string",
+                            "description": (
+                                "Configuration format: 'set' (flat set commands), "
+                                "'text' (stanza/hierarchical), or 'xml'. "
+                                "If omitted, auto-detected from the rendered template content: "
+                                "lines starting with set/delete/deactivate/activate → 'set', "
+                                "otherwise → 'text'."
+                            ),
+                            "enum": ["set", "text", "xml"],
                         },
                     },
                     "required": ["template_content", "vars_content"],
