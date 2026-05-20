@@ -234,23 +234,40 @@ junos-mcp-server:latest python jmcp.py -f /app/config/devices.json -t stdio
 
 **For streamable-http transport:**
 
+> **Security:** the streamable-http transport refuses to start without a valid
+> `.tokens` file. Generate one with `python jmcp_token_manager.py generate
+> --id <token-id>` and mount it into the container as shown below. See
+> [Authentication](#authentication) for details, or pass
+> `--allow-unauthenticated-http` for loopback-only local development.
+
 ```bash
-docker run --rm -it -v /path/to/your/devices.json:/app/config/devices.json -p
-30030:30030 junos-mcp-server:latest python jmcp.py -f /app/config/devices.json
--t streamable-http -H 0.0.0.0
+docker run --rm -it \
+  -v /path/to/your/devices.json:/app/config/devices.json \
+  -v /path/to/.tokens:/app/.tokens \
+  -p 30030:30030 \
+  junos-mcp-server:latest \
+  python jmcp.py -f /app/config/devices.json -t streamable-http -H 0.0.0.0
 ```
 
 **For streamable-http in stateless mode:**
 ```bash
-$ docker run --rm -it -e JMCP_STATELESS=true -v /path/to/your/devices.json:/app/config/devices.json -p 30030:30030 junos-mcp-server:latest python jmcp.py -f /app/config/devices.json -t streamable-http -H 0.0.0.0
+$ docker run --rm -it -e JMCP_STATELESS=true \
+  -v /path/to/your/devices.json:/app/config/devices.json \
+  -v /path/to/.tokens:/app/.tokens \
+  -p 30030:30030 \
+  junos-mcp-server:latest \
+  python jmcp.py -f /app/config/devices.json -t streamable-http -H 0.0.0.0
 ```
 
 **For streamable-http with custom port:**
 
 ```bash
-docker run --rm -it -v /path/to/your/devices.json:/app/config/devices.json -p
-8080:8080 junos-mcp-server:latest python jmcp.py -f /app/config/devices.json -t
-streamable-http -p 8080 -H 0.0.0.0
+docker run --rm -it \
+  -v /path/to/your/devices.json:/app/config/devices.json \
+  -v /path/to/.tokens:/app/.tokens \
+  -p 8080:8080 \
+  junos-mcp-server:latest \
+  python jmcp.py -f /app/config/devices.json -t streamable-http -p 8080 -H 0.0.0.0
 ```
 
 **Note:**
@@ -540,8 +557,11 @@ Token 'vscode-dev' has been revoked
 
 ### Server Authentication Status
 
-The server automatically detects and enables authentication based on the
-presence of tokens:
+For the `streamable-http` transport the server **fails closed**: it refuses to
+start unless a valid, non-empty `.tokens` file is present. The only way to
+start without tokens is the explicit `--allow-unauthenticated-http` flag,
+which is in turn restricted to loopback binds (`127.0.0.1`, `::1`,
+`localhost`).
 
 **With tokens configured:**
 
@@ -553,15 +573,25 @@ INFO - Use jmcp_token_manager.py to manage tokens
 INFO - Streamable HTTP server started on http://127.0.0.1:30030
 ```
 
-**Without tokens configured:**
+**Without tokens configured (default - refuses to start):**
 
 ```bash
 python jmcp.py -f devices.json -t streamable-http
-WARNING - No .tokens file found - server is open to all clients
-INFO - Create tokens using: python jmcp_token_manager.py generate --id <token-i
->
+ERROR - Refusing to start streamable-http transport without authentication: .tokens file not found
+ERROR - Generate a token with: python jmcp_token_manager.py generate --id <token-id>
+ERROR - Or, for local development on loopback only, re-run with --allow-unauthenticated-http
+```
+
+**Explicit unauthenticated mode (loopback only, development only):**
+
+```bash
+python jmcp.py -f devices.json -t streamable-http --allow-unauthenticated-http
+WARNING - *** Streamable HTTP authentication is DISABLED (--allow-unauthenticated-http). .tokens file not found. Server is open to any client that can reach 127.0.0.1:30030 and can commit configuration to mapped devices. Use only for local development. ***
 INFO - Streamable HTTP server started on http://127.0.0.1:30030
 ```
+
+Combining `--allow-unauthenticated-http` with a non-loopback bind (for
+example `-H 0.0.0.0`) is rejected at startup.
 
 ### Client Configuration with Authentication
 

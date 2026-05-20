@@ -2391,39 +2391,88 @@ def main():
     parser.add_argument(
         "-p", "--port", default=30030, type=int, help="Junos MCP Server port"
     )
+    parser.add_argument(
+        "--allow-unauthenticated-http",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow streamable-http to start without token authentication. "
+            "Only permitted when the listener is bound to a loopback address "
+            "(127.0.0.1, ::1, or localhost). Intended for local development "
+            "only - DO NOT use in production."
+        ),
+    )
 
     # Parse the arguments
     args = parser.parse_args()
     global devices
 
-    # Check if authentication should be enabled
+    # Determine whether token authentication is enabled for non-stdio
+    # transports. The server fails closed: if streamable-http is requested
+    # without a valid, non-empty .tokens file, startup is refused unless the
+    # operator explicitly opts in with --allow-unauthenticated-http (and even
+    # then only on a loopback bind).
     auth_enabled = False
-    if args.transport != "stdio":
-        # For non-stdio transports, check if we have tokens configured
+    if args.transport == "stdio":
+        log.info("stdio transport - no authentication required")
+    else:
+        tokens_loaded = False
+        token_error = None
         if os.path.exists(".tokens"):
             try:
                 with open(".tokens", "r") as f:
                     tokens = json.load(f)
-                    if tokens:  # If tokens exist, enable auth
-                        auth_enabled = True
-                        log.info("Token-based authentication enabled")
-                        log.info(
-                            "Clients must send 'Authorization: Bearer <token>' header"
-                        )
-                        log.info("Use jmcp_token_manager.py to manage tokens")
-                    else:
-                        log.warning(
-                            "Empty .tokens file found - server is open to all clients"
-                        )
-            except (json.JSONDecodeError, FileNotFoundError):
-                log.warning("Invalid .tokens file - server is open to all clients")
+                if tokens:
+                    tokens_loaded = True
+                else:
+                    token_error = ".tokens file is empty"
+            except json.JSONDecodeError as e:
+                token_error = f".tokens file is not valid JSON: {e}"
+            except OSError as e:
+                token_error = f".tokens file could not be read: {e}"
         else:
-            log.warning("No .tokens file found - server is open to all clients")
-            log.info(
-                "Create tokens using: python jmcp_token_manager.py generate --id <token-id>"
+            token_error = ".tokens file not found"
+
+        if tokens_loaded:
+            auth_enabled = True
+            log.info("Token-based authentication enabled")
+            log.info("Clients must send 'Authorization: Bearer <token>' header")
+            log.info("Use jmcp_token_manager.py to manage tokens")
+        else:
+            loopback_hosts = {"127.0.0.1", "::1", "localhost"}
+            if not args.allow_unauthenticated_http:
+                log.error(
+                    "Refusing to start %s transport without authentication: %s",
+                    args.transport,
+                    token_error,
+                )
+                log.error(
+                    "Generate a token with: "
+                    "python jmcp_token_manager.py generate --id <token-id>"
+                )
+                log.error(
+                    "Or, for local development on loopback only, re-run with "
+                    "--allow-unauthenticated-http"
+                )
+                sys.exit(1)
+            if args.host not in loopback_hosts:
+                log.error(
+                    "--allow-unauthenticated-http is only permitted when "
+                    "binding to a loopback address (127.0.0.1, ::1, "
+                    "localhost); refusing to bind to %s without "
+                    "authentication",
+                    args.host,
+                )
+                sys.exit(1)
+            log.warning(
+                "*** Streamable HTTP authentication is DISABLED "
+                "(--allow-unauthenticated-http). %s. Server is open to any "
+                "client that can reach %s:%s and can commit configuration "
+                "to mapped devices. Use only for local development. ***",
+                token_error,
+                args.host,
+                args.port,
             )
-    else:
-        log.info("stdio transport - no authentication required")
 
     try:
         with open(args.device_mapping, "r") as f:
