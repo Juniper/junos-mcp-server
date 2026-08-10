@@ -2,7 +2,8 @@
 junos-eznc>=2.7.4
 jxmlease>=1.0.3
 lxml>=6.0.0
-mcp[cli]>=1.12.2
+# mcp 2.0 removed ServerSessionT / streamablehttp_client; stay on 1.x until migrated
+mcp[cli]>=1.12.2,<2.0
 ncclient>=0.6.15
 paramiko>=3.5.1,<4.0
 psutil>=7.0.0
