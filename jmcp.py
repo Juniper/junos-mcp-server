@@ -1253,6 +1253,10 @@ async def handle_render_and_apply_j2_template(
             )
         ]
 
+    is_blocked, blocked_message = check_config_blocklist(rendered_config)
+    if is_blocked:
+        return [types.TextContent(type="text", text=blocked_message)]
+
     application_results = []
 
     # Format detection depends only on the rendered config — do it once for all
