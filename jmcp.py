@@ -37,7 +37,7 @@ from typing import Any, Dict, Generic, Literal
 import anyio
 import mcp.types as types
 import yaml
-from jinja2 import Environment, TemplateError
+from jinja2 import Environment, StrictUndefined, TemplateError
 from jnpr.junos import Device
 from jnpr.junos.exception import (
     ConnectError,
@@ -1120,108 +1120,251 @@ async def handle_junos_config_diff(
     return [content_block]
 
 
+def _detect_config_format(rendered_config: str) -> str:
+    """Classify a rendered configuration as 'set', 'xml', or 'text'.
+
+    XML is detected from a leading '<'. Otherwise the config is 'set' only if
+    every non-blank, non-comment line is a set/delete/deactivate/activate
+    command; anything else means stanza ('text') format.
+    """
+    if rendered_config.lstrip().startswith("<"):
+        return "xml"
+    for line in rendered_config.strip().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if not re.match(r"^(set|delete|deactivate|activate)\s", stripped):
+            return "text"
+    return "set"
+
+
+def _dry_run_commit_check(
+    rtr_name: str, cu: Config, diff: str, msgs: list[tuple[str, str]]
+) -> str:
+    """Commit-check then roll back, appending progress messages to msgs.
+
+    Called with the exclusive Config context still open. A rollback failure
+    propagates to the caller's eviction path — the candidate database would
+    otherwise keep the uncommitted changes for the next borrower of the
+    pooled session.
+    """
+    msgs.append(("info", f"Performing commit check on {rtr_name}..."))
+    try:
+        if cu.commit_check():
+            msgs.append(("info", f"{rtr_name}: Dry-run commit check passed"))
+            entry = f"🔍 {rtr_name}: Configuration check successful. Changes:\n\n{diff}"
+        else:
+            result_msg = "Commit check failed - configuration has errors"
+            msgs.append(("error", f"{rtr_name}: {result_msg}"))
+            entry = f"❌ {rtr_name}: {result_msg}"
+    except Exception as check_error:
+        msgs.append(("error", f"{rtr_name}: Commit check error: {check_error}"))
+        entry = f"❌ {rtr_name}: Commit check error: {check_error}"
+
+    msgs.append(("info", f"{rtr_name}: Rolling back changes (dry-run mode)"))
+    cu.rollback()
+    if cu.diff():
+        msgs.append(
+            (
+                "error",
+                f"{rtr_name}: Rollback verification failed - "
+                "unexpected changes remain",
+            )
+        )
+    else:
+        msgs.append(
+            (
+                "info",
+                f"{rtr_name}: Rollback verified successfully - no pending changes",
+            )
+        )
+    return entry
+
+
+def _apply_rendered_config_sync(
+    rtr_name: str,
+    rendered_config: str,
+    config_format: str,
+    dry_run: bool,
+    commit_comment: str,
+    timeout: int,
+) -> tuple[str, list[tuple[str, str]]]:
+    """Blocking per-router device work, run via anyio.to_thread.run_sync.
+
+    Returns (application-result entry, [(context log level, message), ...]);
+    the async caller replays the messages after the thread returns.
+    """
+    msgs: list[tuple[str, str]] = []
+    with connection_pool.get_connection(rtr_name, timeout) as dev:
+        msgs.append(("info", f"Connected to {rtr_name}"))
+        try:
+            with Config(dev, mode="exclusive") as cu:
+                msgs.append(
+                    (
+                        "info",
+                        f"Loading configuration on {rtr_name} "
+                        f"(format={config_format})...",
+                    )
+                )
+                # "statement not found" is Junos warning a delete targeted a
+                # statement that is already absent — escalating it (PyEZ turns
+                # load warnings into ConfigLoadError) would make re-running a
+                # delete template fail instead of reporting "no changes".
+                cu.load(
+                    rendered_config,
+                    format=config_format,
+                    ignore_warning=["statement not found"],
+                )
+
+                diff = cu.diff()
+                if not diff:
+                    msgs.append(
+                        ("info", f"{rtr_name}: No configuration changes detected")
+                    )
+                    return f"ℹ️  {rtr_name}: No configuration changes detected", msgs
+
+                if dry_run:
+                    return _dry_run_commit_check(rtr_name, cu, diff, msgs), msgs
+
+                msgs.append(("info", f"Performing commit check on {rtr_name}..."))
+                if not cu.commit_check():
+                    result_msg = "Commit check failed - configuration has errors"
+                    msgs.append(("error", f"{rtr_name}: {result_msg}"))
+                    cu.rollback()
+                    return f"❌ {rtr_name}: {result_msg}", msgs
+
+                msgs.append(("info", f"Committing configuration on {rtr_name}..."))
+                cu.commit(comment=commit_comment, timeout=timeout)
+                msgs.append(
+                    ("info", f"{rtr_name}: Configuration committed successfully")
+                )
+                return (
+                    f"✅ {rtr_name}: Configuration committed successfully. "
+                    f"Changes:\n\n{diff}",
+                    msgs,
+                )
+
+        except (ConfigLoadError, CommitError, LockError) as e:
+            # Config.__exit__ released the exclusive lock before this
+            # propagated (a failed unlock raises UnlockError, which is none
+            # of these), so the session is clean and stays pooled.
+            msgs.append(("error", f"{rtr_name}: Configuration error: {e}"))
+            return f"❌ {rtr_name}: Configuration error: {e}", msgs
+        except Exception:
+            # Anything else (an RpcTimeoutError mid-commit, UnlockError from
+            # Config.__exit__, a failed dry-run rollback) may leave the
+            # session holding the exclusive config lock or a dirty candidate
+            # database. Drop the transport so the pool evicts it instead of
+            # handing a poisoned session to the next borrower; mirrors
+            # _load_and_commit_sync.
+            try:
+                dev.close()
+            except Exception:
+                pass
+            raise
+
+
 async def handle_render_and_apply_j2_template(
     arguments: dict, context
 ) -> list[types.ContentBlock]:
     """
     Handler for render_and_apply_j2_template tool
 
-    Renders a Jinja2 template with variables and optionally applies it to devices
+    Renders a Jinja2 template with YAML variables and optionally applies the
+    result to one or more routers (in parallel when several are targeted).
 
     Args:
         arguments: Dictionary containing:
             - template_content: Jinja2 template content as string
-            - vars_content: YAML variables content as string
-            - router_name: Router name to apply config to (optional, single router)
-            - router_names: List of router names to apply config to (optional, multiple routers)
+            - vars_content: YAML variables content as string (must parse to a
+              mapping; variables missing from it fail the render instead of
+              silently rendering empty)
+            - router_name: Single router name to apply config to (optional)
+            - router_names: List of router names (optional; merged and
+              deduplicated with router_name)
             - apply_config: Boolean to apply or just render (default: False)
+            - dry_run: Boolean to commit-check and roll back instead of
+              committing (default: False)
             - commit_comment: Optional commit comment
-            - dry_run: Boolean to show diff without committing (default: False)
-            - config_format: Override format detection ('set', 'text', 'xml'). Auto-detected if omitted.
+            - config_format: Override format detection ('set', 'text', 'xml').
+              Auto-detected if omitted.
+            - timeout: Per-device timeout in seconds
+              (argument -> JUNOS_TIMEOUT env -> 360 default)
         context: MCP Context object
 
     Returns:
         List of TextContent blocks with results
     """
+    import asyncio
+
     template_content = arguments.get("template_content", "")
     vars_content = arguments.get("vars_content", "")
     router_name = arguments.get("router_name", "")
-    router_names = arguments.get("router_names", [])
+    router_names = arguments.get("router_names") or []
     apply_config = arguments.get("apply_config", False)
+    dry_run = arguments.get("dry_run", False)
     commit_comment = arguments.get(
         "commit_comment", "Configuration applied via Jinja2 template"
     )
-    dry_run = arguments.get("dry_run", False)
     config_format_override = arguments.get("config_format", None)
+    timeout = get_timeout_with_fallback(arguments.get("timeout"))
 
-    results = []
+    def _error(message: str) -> list[types.ContentBlock]:
+        return [types.TextContent(type="text", text=message)]
 
     if not template_content:
-        return [
-            types.TextContent(
-                type="text", text="❌ Error: template_content is required"
-            )
-        ]
+        return _error("❌ Error: template_content is required")
 
     if not vars_content:
-        return [
-            types.TextContent(type="text", text="❌ Error: vars_content is required")
-        ]
+        return _error("❌ Error: vars_content is required")
 
     if config_format_override and config_format_override not in ("set", "text", "xml"):
-        return [
-            types.TextContent(
-                type="text",
-                text=(
-                    f"❌ Error: invalid config_format '{config_format_override}'. "
-                    "Must be 'set', 'text', or 'xml'."
-                ),
-            )
-        ]
+        return _error(
+            f"❌ Error: invalid config_format '{config_format_override}'. "
+            "Must be 'set', 'text', or 'xml'."
+        )
 
-    if router_name and not router_names:
-        router_names = [router_name]
+    # Merge the single- and multi-router spellings, dropping duplicates while
+    # preserving order: a repeated name would just serialize on its per-router
+    # pool lock and commit the same change twice.
+    targets = [router_name] if router_name else []
+    targets += [r for r in router_names if r not in targets]
 
     try:
         await context.info("Parsing variables from YAML content...")
         variables = yaml.safe_load(vars_content)
-
-        if not variables:
-            return [
-                types.TextContent(
-                    type="text", text="❌ Error: Variables content is empty or invalid"
-                )
-            ]
-
-        await context.debug(f"Loaded variables: {variables}")
-
     except yaml.YAMLError as e:
-        return [
-            types.TextContent(type="text", text=f"❌ Error parsing YAML content: {e}")
-        ]
-    except Exception as e:
-        return [types.TextContent(type="text", text=f"❌ Error loading variables: {e}")]
+        return _error(f"❌ Error parsing YAML content: {e}")
+
+    if not variables:
+        return _error("❌ Error: Variables content is empty or invalid")
+
+    if not isinstance(variables, dict):
+        return _error(
+            "❌ Error: vars_content must be a YAML mapping of variable names "
+            f"to values, got {type(variables).__name__}"
+        )
+
+    await context.debug(f"Loaded variables: {variables}")
 
     try:
         await context.info("Rendering Jinja2 template...")
-
-        env = Environment(trim_blocks=True, lstrip_blocks=True, autoescape=False)
-
-        template = env.from_string(template_content)
-        rendered_config = template.render(variables)
-
+        env = Environment(
+            trim_blocks=True,
+            lstrip_blocks=True,
+            autoescape=False,
+            undefined=StrictUndefined,
+        )
+        rendered_config = env.from_string(template_content).render(variables)
         await context.debug(f"Rendered configuration:\n{rendered_config}")
-
     except TemplateError as e:
-        return [
-            types.TextContent(type="text", text=f"❌ Error rendering template: {e}")
-        ]
-    except Exception as e:
-        return [
-            types.TextContent(
-                type="text", text=f"❌ Error during template rendering: {e}"
-            )
-        ]
+        # StrictUndefined turns a variable missing from vars_content into an
+        # UndefinedError here, instead of silently rendering an empty string
+        # into the device configuration.
+        return _error(f"❌ Error rendering template: {e}")
+
+    if not rendered_config.strip():
+        return _error("❌ Error: rendered configuration is empty")
 
     if not apply_config:
         result_text = (
@@ -1242,204 +1385,71 @@ async def handle_render_and_apply_j2_template(
             )
         ]
 
-    if not router_names:
-        return [
-            types.TextContent(
-                type="text",
-                text=(
-                    "❌ Error: router_name or router_names must be provided "
-                    "when apply_config=true"
-                ),
-            )
-        ]
+    if not targets:
+        return _error(
+            "❌ Error: router_name or router_names must be provided "
+            "when apply_config=true"
+        )
+
+    # Validate every target before touching any device: applying to a subset
+    # because of one typo would leave the fleet half-configured.
+    unknown_routers = [r for r in targets if r not in devices]
+    if unknown_routers:
+        return _error(
+            "❌ Error: The following routers not found in device mapping: "
+            + ", ".join(unknown_routers)
+            + ". No configuration was applied."
+        )
 
     is_blocked, blocked_message = check_config_blocklist(rendered_config)
     if is_blocked:
-        return [types.TextContent(type="text", text=blocked_message)]
+        return _error(blocked_message)
 
-    application_results = []
-
-    # Format detection depends only on the rendered config — do it once for all
-    # routers.
+    # Format detection depends only on the rendered config — do it once for
+    # all routers.
     if config_format_override:
         config_format = config_format_override
         await context.info(f"Using explicit config format: {config_format}")
     else:
-        config_format = "set"
-        for line in rendered_config.strip().splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if not re.match(r"^(set|delete|deactivate|activate)\s", stripped):
-                config_format = "text"
-                break
+        config_format = _detect_config_format(rendered_config)
         await context.info(f"Auto-detected config format: {config_format}")
 
-    def _apply_config_sync(rtr_name: str) -> tuple[str, list[tuple[str, str]]]:
-        """Blocking per-router device work, run via anyio.to_thread.run_sync.
+    await context.info(
+        f"{'Checking' if dry_run else 'Applying'} configuration on "
+        f"{len(targets)} router(s) in parallel..."
+    )
 
-        Returns (application-result entry, [(context log level, message), ...]);
-        the async caller replays the messages after the thread returns.
-        """
-        msgs: list[tuple[str, str]] = []
-        with connection_pool.get_connection(rtr_name) as dev:
-            msgs.append(("info", f"Connected to {rtr_name}"))
-            try:
-                with Config(dev, mode="exclusive") as cu:
-                    msgs.append(
-                        (
-                            "info",
-                            f"Loading configuration on {rtr_name} "
-                            f"(format={config_format})...",
-                        )
-                    )
-                    cu.load(rendered_config, format=config_format)
-
-                    diff = cu.diff()
-
-                    if not diff:
-                        result_msg = "No configuration changes detected"
-                        msgs.append(("info", f"{rtr_name}: {result_msg}"))
-                        return f"ℹ️  {rtr_name}: {result_msg}", msgs
-
-                    if dry_run:
-                        msgs.append(
-                            ("info", f"Performing commit check on {rtr_name}...")
-                        )
-                        try:
-                            check_result = cu.commit_check()
-
-                            if not check_result:
-                                result_msg = (
-                                    "Commit check failed - configuration has errors"
-                                )
-                                entry = f"❌ {rtr_name}: {result_msg}"
-                                msgs.append(("error", f"{rtr_name}: {result_msg}"))
-                            else:
-                                result_msg = (
-                                    "Configuration check successful. "
-                                    f"Changes:\n\n{diff}"
-                                )
-                                entry = f"🔍 {rtr_name}: {result_msg}"
-                                msgs.append(
-                                    (
-                                        "info",
-                                        f"{rtr_name}: Dry-run commit check passed",
-                                    )
-                                )
-                        except Exception as check_error:
-                            result_msg = f"Commit check error: {check_error}"
-                            entry = f"❌ {rtr_name}: {result_msg}"
-                            msgs.append(("error", f"{rtr_name}: {result_msg}"))
-                        finally:
-                            msgs.append(
-                                (
-                                    "info",
-                                    f"{rtr_name}: Rolling back changes (dry-run mode)",
-                                )
-                            )
-                            try:
-                                cu.rollback()
-                                diff = cu.diff()
-
-                                if diff:
-                                    msgs.append(
-                                        (
-                                            "error",
-                                            f"{rtr_name}: Rollback verification "
-                                            "failed - unexpected changes remain",
-                                        )
-                                    )
-                                    msgs.append(
-                                        (
-                                            "error",
-                                            f"{rtr_name}: Remaining diff:\n{diff}",
-                                        )
-                                    )
-                                else:
-                                    msgs.append(
-                                        (
-                                            "info",
-                                            f"{rtr_name}: Rollback verified "
-                                            "successfully - no pending changes",
-                                        )
-                                    )
-                            except Exception as rollback_error:
-                                msgs.append(
-                                    (
-                                        "error",
-                                        f"{rtr_name}: Rollback failed with "
-                                        f"error: {str(rollback_error)}",
-                                    )
-                                )
-                        return entry, msgs
-
-                    msgs.append(("info", f"Performing commit check on {rtr_name}..."))
-                    check_result = cu.commit_check()
-
-                    if not check_result:
-                        result_msg = "Commit check failed - configuration has errors"
-                        msgs.append(("error", f"{rtr_name}: {result_msg}"))
-                        cu.rollback()
-                        return f"❌ {rtr_name}: {result_msg}", msgs
-
-                    msgs.append(("info", f"Committing configuration on {rtr_name}..."))
-                    cu.commit(comment=commit_comment)
-                    result_msg = (
-                        f"Configuration committed successfully. Changes:\n\n{diff}"
-                    )
-                    msgs.append(
-                        ("info", f"{rtr_name}: Configuration committed successfully")
-                    )
-                    return f"✅ {rtr_name}: {result_msg}", msgs
-
-            except (ConfigLoadError, CommitError, LockError) as e:
-                # Config.__exit__ released the exclusive lock before this
-                # propagated (a failed unlock raises UnlockError, which is none
-                # of these), so the session is clean and stays pooled.
-                error_msg = f"Configuration error: {e}"
-                msgs.append(("error", f"{rtr_name}: {error_msg}"))
-                return f"❌ {rtr_name}: {error_msg}", msgs
-            except Exception:
-                # Anything else (e.g. UnlockError from Config.__exit__) may leave
-                # the session holding the exclusive config lock. Drop the
-                # transport so the pool evicts it instead of getting back a
-                # possibly-locked session; mirrors _load_and_commit_sync.
-                try:
-                    dev.close()
-                except Exception:
-                    pass
-                raise
-
-    for rtr_name in router_names:
-        if rtr_name not in devices:
-            application_results.append(
-                f"❌ {rtr_name}: Router not found in device mapping"
-            )
-            await context.warning(f"Router {rtr_name} not found")
-            continue
-
+    async def _apply_on_router(rtr_name: str) -> tuple[str, list[tuple[str, str]]]:
+        """Run one router's blocking work off the event loop, never raising:
+        each router reports its own success/failure entry so one failure
+        cannot cancel the siblings mid-commit."""
         try:
-            await context.info(
-                f"{'Checking' if dry_run else 'Applying'} configuration on {rtr_name}..."
+            return await anyio.to_thread.run_sync(
+                _apply_rendered_config_sync,
+                rtr_name,
+                rendered_config,
+                config_format,
+                dry_run,
+                commit_comment,
+                timeout,
             )
-
-            entry, msgs = await anyio.to_thread.run_sync(_apply_config_sync, rtr_name)
         except ValueError as ve:
-            application_results.append(f"❌ {rtr_name}: {ve}")
-            await context.error(f"{rtr_name}: {ve}")
-            continue
+            return f"❌ {rtr_name}: {ve}", [("error", f"{rtr_name}: {ve}")]
         except ConnectError as e:
             error_msg = f"Connection failed: {e}"
-            application_results.append(f"❌ {rtr_name}: {error_msg}")
-            await context.error(f"{rtr_name}: {error_msg}")
-            continue
+            return f"❌ {rtr_name}: {error_msg}", [
+                ("error", f"{rtr_name}: {error_msg}")
+            ]
         except Exception as e:
             error_msg = f"Failed to apply configuration: {e}"
-            application_results.append(f"❌ {rtr_name}: {error_msg}")
-            await context.error(f"{rtr_name}: {error_msg}")
-            continue
+            return f"❌ {rtr_name}: {error_msg}", [
+                ("error", f"{rtr_name}: {error_msg}")
+            ]
 
+    outcomes = await asyncio.gather(*(_apply_on_router(r) for r in targets))
+
+    application_results = []
+    for entry, msgs in outcomes:
         for level, message in msgs:
             if level == "error":
                 await context.error(message)
@@ -1454,7 +1464,7 @@ async def handle_render_and_apply_j2_template(
 
     final_text = (
         mode_prefix + "Configuration " + mode_name + " complete!\n\n"
-        "**Routers:** " + ", ".join(router_names) + "\n\n"
+        "**Routers:** " + ", ".join(targets) + "\n\n"
         "**Rendered Configuration:**\n"
         "```\n" + rendered_config + "\n```\n\n"
         "**Results:**\n" + summary + "\n"
@@ -1465,7 +1475,7 @@ async def handle_render_and_apply_j2_template(
             type="text",
             text=final_text,
             annotations={
-                "router_names": router_names,
+                "router_names": targets,
                 "rendered_config": rendered_config,
                 "dry_run": dry_run,
                 "variables": str(variables),
@@ -1924,7 +1934,11 @@ def create_mcp_server() -> Server:
                     "on the device and display the diff without committing — changes are "
                     "automatically rolled back after the check. "
                     "Use router_name for a single device or router_names (list) for multiple "
-                    "devices; at least one must be provided when apply_config=true."
+                    "devices; at least one must be provided when apply_config=true, and "
+                    "every name is validated before any device is touched. "
+                    "Multiple routers are configured in parallel. "
+                    "Template variables missing from vars_content fail the render instead "
+                    "of silently rendering as empty strings."
                 ),
                 inputSchema={
                     "type": "object",
@@ -1941,7 +1955,7 @@ def create_mcp_server() -> Server:
                             "items": {"type": "string"},
                             "description": (
                                 "JSON array of router name strings to apply the configuration to "
-                                "in sequence, e.g. ['pe1', 'pe2', 'pe3']. "
+                                "in parallel, e.g. ['pe1', 'pe2', 'pe3']. "
                                 "Each element must exactly match a name in the device mapping. "
                                 "Use this instead of router_name when targeting multiple devices. "
                                 "Required when apply_config=true and router_name is not provided."
@@ -1983,10 +1997,19 @@ def create_mcp_server() -> Server:
                                 "Configuration format: 'set' (flat set commands), "
                                 "'text' (stanza/hierarchical), or 'xml'. "
                                 "If omitted, auto-detected from the rendered template content: "
-                                "lines starting with set/delete/deactivate/activate → 'set', "
-                                "otherwise → 'text'."
+                                "a leading '<' → 'xml', lines starting with "
+                                "set/delete/deactivate/activate → 'set', otherwise → 'text'."
                             ),
                             "enum": ["set", "text", "xml"],
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": (
+                                "Per-device timeout in seconds applied to the connection "
+                                "and the commit RPC. Falls back to the JUNOS_TIMEOUT "
+                                "environment variable, then 360."
+                            ),
+                            "default": 360,
                         },
                     },
                     "required": ["template_content", "vars_content"],
