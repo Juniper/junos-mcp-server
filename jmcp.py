@@ -637,13 +637,45 @@ def check_config_blocklist(
     return False, None
 
 
+_CMD_REGEX_METACHARACTERS = re.compile(r"[.^$*+?{}\[\]()|\\]")
+
+
+def _command_token_matches(pattern_token: str, actual_token: str) -> bool:
+    """True if actual_token satisfies pattern_token.
+
+    Tokens containing regex syntax (e.g. a trailing `(.*)`) are matched via
+    fullmatch, as before. Plain literal keyword tokens are matched allowing
+    Junos-style unambiguous prefix abbreviation (`req` satisfies `request`),
+    case-insensitively — Junos itself accepts any unambiguous prefix of a
+    keyword, so a literal-only match lets abbreviated commands (e.g. `req
+    sys reboot` for `request system reboot`) reach the device unblocked.
+    """
+    if _CMD_REGEX_METACHARACTERS.search(pattern_token):
+        return bool(re.fullmatch(pattern_token, actual_token, re.IGNORECASE))
+    return bool(actual_token) and pattern_token.lower().startswith(actual_token.lower())
+
+
+def _command_matches_pattern(
+    pattern_tokens: list[str], command_tokens: list[str]
+) -> bool:
+    """Prefix-style token match: every pattern token must be satisfied by the
+    token in the same position; extra trailing command_tokens are allowed
+    (e.g. `request system reboot`'s optional `at HH:MM` arguments)."""
+    if len(command_tokens) < len(pattern_tokens):
+        return False
+    return all(
+        _command_token_matches(p, a) for p, a in zip(pattern_tokens, command_tokens)
+    )
+
+
 def check_command_blocklist(
     command: str, block_file: str = "block.cmd"
 ) -> tuple[bool, str | None]:
     """Return whether the submitted operational command should be blocked.
 
-    Each non-comment line in block.cmd is treated as a regex prefix pattern. If the
-    normalized command starts with any pattern, command execution is rejected.
+    Each non-comment line in block.cmd is a token-wise blocked pattern. A
+    command is blocked if, token by token, it matches or is an unambiguous
+    Junos-style abbreviation of every pattern token.
     """
     if not command:
         return False, None
@@ -669,18 +701,22 @@ def check_command_blocklist(
         return True, f"Error: unable to read blocklist file '{block_file_path}': {e}"
 
     normalized_command = " ".join(command.split())
+    command_tokens = normalized_command.split()
 
     for pattern in blocked_patterns:
+        pattern_tokens = pattern.split()
         try:
-            if re.match(pattern, normalized_command):
-                return True, (
-                    f"Blocked command rejected: command '{normalized_command}' "
-                    f"matches blocked pattern '{pattern}'"
-                )
+            matched = _command_matches_pattern(pattern_tokens, command_tokens)
         except re.error as e:
             return (
                 True,
                 f"Error: invalid regex in '{block_file_path}': '{pattern}' ({e})",
+            )
+
+        if matched:
+            return True, (
+                f"Blocked command rejected: command '{normalized_command}' "
+                f"matches blocked pattern '{pattern}'"
             )
 
     return False, None
