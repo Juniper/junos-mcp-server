@@ -20,6 +20,19 @@ class BlocklistGuardrailsTests(unittest.TestCase):
             self.assertTrue(blocked)
             self.assertIn("matches blocked pattern", message)
 
+    def test_blocks_abbreviated_literal_tokens(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            block_file = Path(tmpdir) / "block.cfg"
+            block_file.write_text("set system root-authentication\n", encoding="utf-8")
+
+            blocked, message = check_config_blocklist(
+                "set sys root-auth encrypted-password foo",
+                block_file=str(block_file),
+            )
+
+            self.assertTrue(blocked)
+            self.assertIn("matches blocked pattern", message)
+
     def test_blocks_regex_pattern(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             block_file = Path(tmpdir) / "block.cfg"
@@ -117,6 +130,19 @@ class CommandBlocklistGuardrailsTests(unittest.TestCase):
 
             blocked, message = check_command_blocklist(
                 "request system reboot in 1",
+                block_file=str(block_file),
+            )
+
+            self.assertTrue(blocked)
+            self.assertIn("matches blocked pattern", message)
+
+    def test_blocks_abbreviated_literal_tokens(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            block_file = Path(tmpdir) / "block.cmd"
+            block_file.write_text("request system reboot\n", encoding="utf-8")
+
+            blocked, message = check_command_blocklist(
+                "req sys reb",
                 block_file=str(block_file),
             )
 

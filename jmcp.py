@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import sys
 import threading
@@ -65,6 +66,7 @@ from utils.config import (
     prepare_connection_params,
     validate_all_devices,
 )
+from utils.token_file import DEFAULT_TOKENS_FILE
 
 # Setup logging
 logging.basicConfig(
@@ -532,6 +534,61 @@ def get_timeout_with_fallback(arguments_timeout: int = None) -> int:
     return 360
 
 
+def _split_blocklist_pattern_tokens(pattern: str) -> list[str]:
+    """Split a pattern without breaking regex character classes containing spaces."""
+    tokens: list[str] = []
+    current: list[str] = []
+    in_char_class = False
+    escaped = False
+
+    for char in pattern:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+
+        if char == "\\":
+            current.append(char)
+            escaped = True
+            continue
+
+        if char == "[":
+            in_char_class = True
+        elif char == "]" and in_char_class:
+            in_char_class = False
+
+        if char.isspace() and not in_char_class:
+            if current:
+                tokens.append("".join(current))
+                current = []
+            continue
+
+        current.append(char)
+
+    if current:
+        tokens.append("".join(current))
+
+    return tokens
+
+
+def _matches_blocklist_tokens(value: str, pattern: str) -> bool:
+    """Match a blocked prefix, including abbreviated literal Junos keywords."""
+    value_tokens = value.split()
+    pattern_tokens = _split_blocklist_pattern_tokens(pattern)
+    if len(value_tokens) < len(pattern_tokens):
+        return False
+
+    regex_metacharacters = frozenset(".^$*+?{}[]\\|()")
+    for value_token, pattern_token in zip(value_tokens, pattern_tokens):
+        if regex_metacharacters.isdisjoint(pattern_token):
+            if not pattern_token.startswith(value_token):
+                return False
+        elif not re.fullmatch(pattern_token, value_token):
+            return False
+
+    return True
+
+
 def check_config_blocklist(
     config_text: str, block_file: str = "block.cfg"
 ) -> tuple[bool, str | None]:
@@ -564,71 +621,17 @@ def check_config_blocklist(
         " ".join(line.split()) for line in config_text.splitlines() if line.strip()
     ]
 
-    def split_pattern_tokens(pattern_line: str) -> list[str]:
-        """Split pattern into tokens while preserving spaces inside regex char
-        classes like `[^ ]+`."""
-        tokens: list[str] = []
-        current: list[str] = []
-        in_char_class = False
-        escaped = False
-
-        for ch in pattern_line:
-            if escaped:
-                current.append(ch)
-                escaped = False
-                continue
-
-            if ch == "\\":
-                current.append(ch)
-                escaped = True
-                continue
-
-            if ch == "[":
-                in_char_class = True
-                current.append(ch)
-                continue
-
-            if ch == "]" and in_char_class:
-                in_char_class = False
-                current.append(ch)
-                continue
-
-            if ch.isspace() and not in_char_class:
-                if current:
-                    tokens.append("".join(current))
-                    current = []
-                continue
-
-            current.append(ch)
-
-        if current:
-            tokens.append("".join(current))
-
-        return tokens
-
     for pattern in blocked_patterns:
-        pattern_tokens = split_pattern_tokens(pattern)
-
         for config_line in config_lines:
-            config_tokens = config_line.split()
+            try:
+                matches = _matches_blocklist_tokens(config_line, pattern)
+            except re.error as e:
+                return (
+                    True,
+                    f"Error: invalid regex in '{block_file_path}': '{pattern}' ({e})",
+                )
 
-            # Prefix-style token match: all pattern tokens must match the first N config tokens.
-            if len(config_tokens) < len(pattern_tokens):
-                continue
-
-            token_match = True
-            for config_token, pattern_token in zip(config_tokens, pattern_tokens):
-                try:
-                    if not re.fullmatch(pattern_token, config_token):
-                        token_match = False
-                        break
-                except re.error as e:
-                    return (
-                        True,
-                        f"Error: invalid regex in '{block_file_path}': '{pattern_token}' ({e})",
-                    )
-
-            if token_match:
+            if matches:
                 return True, (
                     f"Blocked configuration rejected: line '{config_line}' "
                     f"matches blocked pattern '{pattern}'"
@@ -672,7 +675,9 @@ def check_command_blocklist(
 
     for pattern in blocked_patterns:
         try:
-            if re.match(pattern, normalized_command):
+            if re.match(pattern, normalized_command) or _matches_blocklist_tokens(
+                normalized_command, pattern
+            ):
                 return True, (
                     f"Blocked command rejected: command '{normalized_command}' "
                     f"matches blocked pattern '{pattern}'"
@@ -686,30 +691,43 @@ def check_command_blocklist(
     return False, None
 
 
-def validate_token_from_file(token: str) -> bool:
-    """Validate if a token exists in the .tokens file"""
+def validate_token_from_file(
+    token: str, token_file: str | Path = DEFAULT_TOKENS_FILE
+) -> bool:
+    """Validate a token against the configured token file."""
     try:
-        if not os.path.exists(".tokens"):
+        if not os.path.exists(token_file):
             return False
 
-        with open(".tokens", "r") as f:
+        with open(token_file, "r", encoding="utf-8") as f:
             tokens = json.load(f)
 
+        presented_token = token.encode("utf-8")
+        token_is_valid = False
         for token_data in tokens.values():
-            if token_data.get("token") == token:
-                return True
+            stored_token = token_data.get("token")
+            if isinstance(stored_token, str):
+                token_is_valid |= secrets.compare_digest(
+                    stored_token.encode("utf-8"), presented_token
+                )
 
-        return False
-    except (json.JSONDecodeError, FileNotFoundError, KeyError):
+        return token_is_valid
+    except (json.JSONDecodeError, OSError, AttributeError):
         return False
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
     """Middleware to check Bearer token authentication for streamable-http"""
 
-    def __init__(self, app, auth_enabled: bool = True):
+    def __init__(
+        self,
+        app,
+        auth_enabled: bool = True,
+        token_file: str | Path = DEFAULT_TOKENS_FILE,
+    ):
         super().__init__(app)
         self.auth_enabled = auth_enabled
+        self.token_file = Path(token_file).resolve()
 
     async def dispatch(self, request: Request, call_next):
         # Log all incoming requests
@@ -753,8 +771,7 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
 
         token = auth_header[7:]  # Remove "Bearer " prefix
 
-        # Validate token against .tokens file
-        if not validate_token_from_file(token):
+        if not validate_token_from_file(token, self.token_file):
             log.warning(
                 "Invalid token attempt from %s",
                 request.client.host if request.client else "unknown",
@@ -2098,6 +2115,11 @@ def main():
         "-p", "--port", default=30030, type=int, help="Junos MCP Server port"
     )
     parser.add_argument(
+        "--tokens-file",
+        default=str(DEFAULT_TOKENS_FILE),
+        help="path to the token file (default: alongside jmcp.py)",
+    )
+    parser.add_argument(
         "--allow-unauthenticated-http",
         action="store_true",
         default=False,
@@ -2111,11 +2133,12 @@ def main():
 
     # Parse the arguments
     args = parser.parse_args()
+    token_file = Path(args.tokens_file).expanduser().resolve()
     global devices
 
     # Determine whether token authentication is enabled for non-stdio
     # transports. The server fails closed: if streamable-http is requested
-    # without a valid, non-empty .tokens file, startup is refused unless the
+    # without a valid, non-empty token file, startup is refused unless the
     # operator explicitly opts in with --allow-unauthenticated-http (and even
     # then only on a loopback bind).
     auth_enabled = False
@@ -2124,20 +2147,20 @@ def main():
     else:
         tokens_loaded = False
         token_error = None
-        if os.path.exists(".tokens"):
+        if token_file.exists():
             try:
-                with open(".tokens", "r") as f:
+                with open(token_file, "r", encoding="utf-8") as f:
                     tokens = json.load(f)
                 if tokens:
                     tokens_loaded = True
                 else:
-                    token_error = ".tokens file is empty"
+                    token_error = f"token file '{token_file}' is empty"
             except json.JSONDecodeError as e:
-                token_error = f".tokens file is not valid JSON: {e}"
+                token_error = f"token file '{token_file}' is not valid JSON: {e}"
             except OSError as e:
-                token_error = f".tokens file could not be read: {e}"
+                token_error = f"token file '{token_file}' could not be read: {e}"
         else:
-            token_error = ".tokens file not found"
+            token_error = f"token file '{token_file}' not found"
 
         if tokens_loaded:
             auth_enabled = True
@@ -2239,7 +2262,11 @@ def main():
                 middleware = []
                 if auth_enabled:
                     middleware.append(
-                        Middleware(BearerTokenMiddleware, auth_enabled=True)
+                        Middleware(
+                            BearerTokenMiddleware,
+                            auth_enabled=True,
+                            token_file=token_file,
+                        )
                     )
 
                 # Create Starlette app

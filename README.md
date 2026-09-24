@@ -398,6 +398,11 @@ authentication available
 The server includes a dedicated token management CLI tool:
 `jmcp_token_manager.py`
 
+By default, both the server and token manager use the `.tokens` file alongside
+`jmcp.py`, independent of the current working directory. On POSIX systems, the
+token manager creates the file with owner-only permissions (`0600`) and repairs
+those permissions whenever it writes an existing file.
+
 #### Generate a New Token
 
 ```bash
@@ -407,6 +412,9 @@ python jmcp_token_manager.py generate --id "vscode-dev"
 # With description
 python jmcp_token_manager.py generate --id "vscode-dev" --description "VSCode
 development environment"
+
+# Use a custom token file location
+python jmcp_token_manager.py --tokens-file /secure/path/tokens.json generate --id "vscode-dev"
 
 # Example output:
 Generated new token:
@@ -459,6 +467,12 @@ start unless a valid, non-empty `.tokens` file is present. The only way to
 start without tokens is the explicit `--allow-unauthenticated-http` flag,
 which is in turn restricted to loopback binds (`127.0.0.1`, `::1`,
 `localhost`).
+
+To use a custom location, pass the same path to the server:
+
+```bash
+python jmcp.py -f devices.json -t streamable-http --tokens-file /secure/path/tokens.json
+```
 
 **With tokens configured:**
 
@@ -595,6 +609,7 @@ The `load_and_commit_config` tool now includes a pre-commit guardrail check that
 - Each non-comment line in `block.cfg` is treated as a blocked pattern.
 - Pattern matching is done against normalized config lines from the submitted `config_text`.
 - Patterns support regex tokens (for example to match dynamic usernames).
+- Literal keyword tokens also match non-empty Junos CLI abbreviations, so `set sys root-auth` matches `set system root-authentication`.
 - If any line matches, the request is rejected and **no configuration is loaded or committed**.
 
 ### Example `block.cfg`
@@ -615,6 +630,7 @@ The `execute_junos_command` and `execute_junos_command_batch` tools now include 
 
 - Each non-comment line in `block.cmd` is treated as a regex command pattern.
 - Submitted commands are normalized and checked before execution.
+- Literal keyword tokens match both their full form and non-empty Junos CLI abbreviations; regex patterns remain supported.
 - If a command matches a blocked pattern, execution is rejected.
 - For batch execution, the blocked command is rejected before dispatching to routers.
 

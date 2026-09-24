@@ -27,7 +27,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any
 
-TOKENS_FILE = ".tokens"
+from utils.token_file import DEFAULT_TOKENS_FILE
+
+TOKENS_FILE = DEFAULT_TOKENS_FILE
 
 
 def generate_token() -> str:
@@ -42,7 +44,7 @@ def load_tokens() -> Dict[str, Any]:
         return {}
 
     try:
-        with open(TOKENS_FILE, "r") as f:
+        with open(TOKENS_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, FileNotFoundError):
         return {}
@@ -50,8 +52,17 @@ def load_tokens() -> Dict[str, Any]:
 
 def save_tokens(tokens: Dict[str, Any]) -> None:
     """Save tokens to file"""
-    with open(TOKENS_FILE, "w") as f:
-        json.dump(tokens, f, indent=2)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    file_descriptor = os.open(TOKENS_FILE, flags, 0o600)
+    try:
+        os.fchmod(file_descriptor, 0o600)
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as f:
+            file_descriptor = -1
+            json.dump(tokens, f, indent=2)
+    finally:
+        if file_descriptor != -1:
+            os.close(file_descriptor)
 
 
 def generate_token_command(token_id: str, description: str = None) -> None:
@@ -134,14 +145,21 @@ def validate_token(token: str) -> bool:
     """Validate if a token exists in the tokens file"""
     tokens = load_tokens()
 
+    presented_token = token.encode("utf-8")
+    token_is_valid = False
     for token_data in tokens.values():
-        if token_data["token"] == token:
-            return True
+        stored_token = token_data.get("token")
+        if isinstance(stored_token, str):
+            token_is_valid |= secrets.compare_digest(
+                stored_token.encode("utf-8"), presented_token
+            )
 
-    return False
+    return token_is_valid
 
 
 def main():
+    global TOKENS_FILE
+
     parser = argparse.ArgumentParser(
         description="Junos MCP Server Token Manager",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -152,6 +170,11 @@ Examples:
   %(prog)s show --id "vscode-dev"
   %(prog)s revoke --id "vscode-dev"
         """,
+    )
+    parser.add_argument(
+        "--tokens-file",
+        default=str(DEFAULT_TOKENS_FILE),
+        help="path to the token file (default: alongside jmcp.py)",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
@@ -177,6 +200,7 @@ Examples:
     revoke_parser.add_argument("--id", required=True, help="Token ID to revoke")
 
     args = parser.parse_args()
+    TOKENS_FILE = Path(args.tokens_file).expanduser().resolve()
 
     if not args.command:
         parser.print_help()
