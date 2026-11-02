@@ -377,7 +377,7 @@ requires-dist = [
     { name = "junos-eznc", specifier = ">=2.7.4" },
     { name = "jxmlease", specifier = ">=1.0.3" },
     { name = "lxml", specifier = ">=6.0.0" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.12.2" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.12.2,<2.0" },
     { name = "ncclient", specifier = ">=0.6.15" },
     { name = "paramiko", specifier = ">=3.5.1" },
     { name = "psutil", specifier = ">=7.0.0" },
