@@ -199,7 +199,9 @@ class RenderApplyTests(unittest.TestCase):
         # get_connection stamps the borrowed session with the call's timeout.
         self.assertEqual(mock_device.timeout, 42)
         cu.commit.assert_called_once_with(
-            comment="Configuration applied via Jinja2 template", timeout=42
+            comment="Configuration applied via Jinja2 template",
+            confirm=None,
+            timeout=42,
         )
 
     @patch("jmcp.Config")
@@ -217,7 +219,9 @@ class RenderApplyTests(unittest.TestCase):
         self.assertIn("✅ router1", result[0].text)
         self.assertEqual(mock_device.timeout, 77)
         cu.commit.assert_called_once_with(
-            comment="Configuration applied via Jinja2 template", timeout=77
+            comment="Configuration applied via Jinja2 template",
+            confirm=None,
+            timeout=77,
         )
 
     @patch("jmcp.Config")

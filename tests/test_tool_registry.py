@@ -31,6 +31,7 @@ EXPECTED_TOOLS = {
     "gather_device_facts",
     "get_router_list",
     "load_and_commit_config",
+    "confirm_commit",
 }
 
 REMOVED_TOOLS = {"add_device", "reload_devices"}

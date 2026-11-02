@@ -38,7 +38,7 @@ docker run --rm -it -v /path/to/devices.json:/app/config/devices.json -p 30030:3
 
 ## Architecture
 
-The server implements 9 MCP tools in `jmcp.py`:
+The server implements 10 MCP tools in `jmcp.py`:
 
 1. **execute_junos_command** - Execute arbitrary CLI commands on routers
 2. **execute_junos_command_batch** - Execute the same command on multiple routers in parallel
@@ -48,7 +48,8 @@ The server implements 9 MCP tools in `jmcp.py`:
 6. **render_and_apply_j2_template** - Render a Jinja2 template and load/commit it
 7. **gather_device_facts** - Collect device information using PyEZ facts
 8. **get_router_list** - List available routers from the configuration
-9. **load_and_commit_config** - Apply configuration changes (supports set/text/xml formats)
+9. **load_and_commit_config** - Apply configuration changes (supports set/text/xml formats); always runs a commit check first, with optional `dry_run` and `confirm_timeout_mins` (commit confirmed)
+10. **confirm_commit** - Confirm a pending commit confirmed so the device does not roll back
 
 Device inventory is defined solely by the JSON mapping file loaded and validated at startup. The former `add_device` and `reload_devices` runtime device-management tools were removed for security reasons (see `.commit-logs.txt`): they let any MCP client register attacker-controlled hosts, probe arbitrary IP:port pairs, and swap the device map from arbitrary server file paths.
 
@@ -82,7 +83,7 @@ The device configuration file must follow this structure:
 
 ## Security Considerations
 
-- **CRITICAL**: Configuration changes are automatically committed to devices when using `load_and_commit_config`
+- **CRITICAL**: Configuration changes are automatically committed to devices when using `load_and_commit_config` (after a commit check). Use `confirm_timeout_mins` for an automatic rollback safety net, then `confirm_commit`
 - SSH key authentication is strongly recommended over passwords
 - The server exposes network infrastructure to LLM access - ensure corporate policies allow this
 - Always review LLM-generated configurations before allowing execution
