@@ -1,0 +1,93 @@
+name: Container Image
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TEST_IMAGE: local/junos-mcp-server:test
+
+jobs:
+  validate:
+    name: Validate ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            architecture: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            architecture: arm64
+            runner: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.2.0
+
+      - name: Build validation image
+        uses: docker/build-push-action@v7.3.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: ${{ env.TEST_IMAGE }}
+          labels: org.opencontainers.image.source=https://github.com/Juniper/junos-mcp-server
+          cache-from: type=gha,scope=validate-${{ matrix.architecture }}
+          cache-to: type=gha,mode=max,scope=validate-${{ matrix.architecture }}
+
+      - name: Smoke-test Junos MCP runtime
+        run: |
+          docker run --rm --entrypoint sh "${TEST_IMAGE}" -ec '
+            python -c "import jnpr.junos, jxmlease, lxml, mcp, ncclient, paramiko, psutil, serial, starlette, uvicorn"
+            python -m compileall -q /app
+            test -s /app/jmcp.py
+            test "$(id -u)" -ne 0
+            command -v ssh
+            ssh -V
+          '
+
+      - name: Scan HIGH and CRITICAL vulnerabilities
+        env:
+          TRIVY_SHOW_SUPPRESSED: "true"
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          version: v0.69.3
+          image-ref: ${{ env.TEST_IMAGE }}
+          scanners: vuln
+          format: json
+          output: trivy-${{ matrix.architecture }}.json
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          trivyignores: .trivyignore.yaml
+
+      - name: Upload vulnerability report
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: trivy-junos-mcp-${{ matrix.architecture }}
+          path: trivy-${{ matrix.architecture }}.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce CRITICAL vulnerability baseline
+        uses: aquasecurity/trivy-action@v0.35.0
+        with:
+          version: v0.69.3
+          skip-setup-trivy: true
+          image-ref: ${{ env.TEST_IMAGE }}
+          scanners: vuln
+          format: table
+          severity: CRITICAL
+          exit-code: "1"
+          trivyignores: .trivyignore.yaml

@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -32,22 +31,27 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: uv.lock
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install black pylint nose2 coverage
+          python -m pip install uv==0.12.1
+          uv sync --frozen --no-dev
+          uv pip install --python .venv/bin/python black pylint nose2 coverage
 
       - name: Run Code Quality Tools
         if: matrix.os == 'ubuntu-latest'
         run: |
-          black --check --fast .
-          pylint $(git ls-files '*.py' | grep -vE '^(docs/|build/|tests/|samples/|setup.py|versioneer.py)') --exit-zero
+          .venv/bin/black --check --fast .
+          mapfile -t python_files < <(
+            git ls-files '*.py' |
+              grep -vE '^(docs/|build/|tests/|samples/|setup.py|versioneer.py)'
+          )
+          .venv/bin/pylint "${python_files[@]}" --exit-zero
 
       - name: Run Unit Tests
-        run: python -m unittest discover -s tests -v
+        run: .venv/bin/python -m unittest discover -s tests -v
 
       - name: Upload Test Reports
         if: always()
